@@ -15,8 +15,11 @@ This version of AgentScheduler is might be compatible with:
 
 ### Using with SD.Next
 
-- The extension is already included in https://github.com/liutyi/sdnext/tree/ipex
-- Need Manual install in SD.Next since about 20025-10 (no longer built-in)
+- The extension is already included in
+  - https://github.com/liutyi/sdnext/tree/ipex
+  - https://github.com/liutyi/sdnext/tree/pytorch
+- Need Manual install in SD.Next since about 2025-10 (no longer built-in)
+  - https://github.com/vladmandic/sdnext
 
 ### Using the built-in extension list
 
