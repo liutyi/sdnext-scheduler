@@ -3,7 +3,7 @@ import json
 import gradio as gr
 from PIL import Image
 from uuid import uuid4
-from typing import List
+from typing import List, Optional
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -67,6 +67,11 @@ task_history_retenion_map = {
 }
 
 init_db()
+
+control_generate_button = None
+control_enqueue_row = None
+control_checkpoint_dropdown = None
+control_submit_button = None
 
 
 class Script(scripts.Script):
@@ -234,6 +239,167 @@ class Script(scripts.Script):
             task_runner.execute_pending_tasks_threading()
 
         return f
+
+
+def add_control_enqueue_button():
+    global control_enqueue_row, control_checkpoint_dropdown, control_submit_button
+
+    if control_enqueue_row is not None:
+        return
+
+    with gr.Row(elem_id="control_enqueue_wrapper") as row:
+        control_enqueue_row = row
+        hide_checkpoint = getattr(shared.opts, "queue_button_hide_checkpoint", True)
+        control_checkpoint_dropdown = gr.Dropdown(
+            choices=get_checkpoint_choices(),
+            value=checkpoint_current,
+            show_label=False,
+            interactive=True,
+            visible=not hide_checkpoint,
+        )
+        if not hide_checkpoint:
+            create_refresh_button(
+                control_checkpoint_dropdown,
+                refresh_checkpoints,
+                lambda: {"choices": get_checkpoint_choices()},
+                "refresh_control_checkpoint",
+            )
+        control_submit_button = gr.Button(
+            "Enqueue",
+            elem_id="control_enqueue",
+            elem_classes=["sd-button"],
+            variant="primary",
+            tooltip="Enqueue",
+        )
+
+
+def after_component_control(component, **_kwargs):
+    global control_generate_button
+
+    if component.elem_id != "control_generate":
+        return
+
+    control_generate_button = component
+    add_control_enqueue_button()
+
+
+def bind_control_enqueue_button(root: gr.Blocks):
+    if control_generate_button is None or control_submit_button is None:
+        log.debug("[AgentScheduler] control enqueue bind skipped (missing button)")
+        return
+
+    dependencies = [
+        x
+        for x in root.dependencies
+        if x["trigger"] == "click" and control_generate_button._id in x["targets"]
+    ]
+    if len(dependencies) == 0:
+        log.debug("[AgentScheduler] control enqueue bind skipped (no dependencies)")
+        return
+
+    dependency = max(dependencies, key=lambda d: len(d["inputs"]))
+    fn_block = next(fn for fn in root.fns if compare_components_with_ids(fn.inputs, dependency["inputs"]))
+    inputs = fn_block.inputs.copy()
+    inputs.insert(0, control_checkpoint_dropdown)
+
+    def find_input_index(elem_id: str) -> Optional[int]:
+        for idx, comp in enumerate(inputs):
+            if getattr(comp, "elem_id", None) == elem_id:
+                return idx
+        return None
+
+    input_start_idx = find_input_index("control_input_type")
+    input_ids = [getattr(comp, "elem_id", None) for comp in inputs]
+
+    with root:
+        control_submit_button.click(
+            fn=wrap_register_control_task(
+                input_start_idx=input_start_idx,
+                ui_input_ids=input_ids,
+            ),
+            _js="submit_enqueue_control",
+            inputs=inputs,
+            outputs=None,
+            show_progress=False,
+        )
+
+
+def wrap_register_control_task(
+    input_start_idx: Optional[int] = None,
+    ui_input_ids: Optional[List[Optional[str]]] = None,
+):
+    def f(request: gr.Request, *args):
+        if len(args) < 2:
+            raise Exception("Invalid call")
+
+        checkpoint: str = args[0]
+        task_id = args[1]
+
+        if input_start_idx is None:
+            raise ValueError("Control enqueue input alignment failed: control_input_type not found")
+        start_idx = input_start_idx
+
+        state_idx = start_idx - 2
+        active_tab_idx = start_idx - 1
+
+        state = args[state_idx] if len(args) > state_idx and state_idx >= 0 else ""
+        active_tab = args[active_tab_idx] if len(args) > active_tab_idx and active_tab_idx >= 0 else "control"
+        if not active_tab:
+            active_tab = "control"
+
+        control_args = list(args[start_idx:]) if len(args) > start_idx else []
+        control_arg_ids = (
+            ui_input_ids[start_idx:] if ui_input_ids is not None and len(ui_input_ids) > start_idx else []
+        )
+        named_args = {
+            elem_id: value
+            for elem_id, value in zip(control_arg_ids, control_args)
+            if elem_id
+        }
+        if named_args:
+            named_args["control_input_type"] = 0
+        for key in ("control_sampling", "control_sampling_alt"):
+            value = named_args.get(key)
+            if isinstance(value, float):
+                named_args[key] = int(value)
+
+        task_name = None
+        if task_id == queue_with_every_checkpoints:
+            task_id = str(uuid4())
+            checkpoint = list_checkpoint_tiles()
+        else:
+            if not task_id.startswith("task("):
+                task_name = task_id
+                task_id = str(uuid4())
+
+            if checkpoint is None or checkpoint == "" or checkpoint == checkpoint_current:
+                checkpoint = [shared.sd_model.sd_checkpoint_info.title]
+            elif checkpoint == checkpoint_runtime:
+                checkpoint = [None]
+            elif checkpoint.endswith(" checkpoints)"):
+                checkpoint_dir = " ".join(checkpoint.split(" ")[0:-2])
+                checkpoint = list(filter(lambda c: c.startswith(checkpoint_dir), list_checkpoint_tiles()))
+            else:
+                checkpoint = [checkpoint]
+
+        for i, c in enumerate(checkpoint):
+            t_id = task_id if i == 0 else f"{task_id}.{i}"
+            task_runner.register_control_task(
+                t_id,
+                state,
+                active_tab,
+                named_args,
+                control_arg_ids,
+                control_args,
+                checkpoint=c,
+                task_name=task_name,
+                request=request,
+                control_mode="text_only",
+            )
+
+        task_runner.execute_pending_tasks_threading()
+
+    return f
 
 
 def get_checkpoint_choices():
@@ -767,6 +933,7 @@ def on_app_started(block: gr.Blocks, app):
     task_runner.execute_pending_tasks_threading()
     regsiter_apis(app, task_runner)
     task_runner.on_task_cleared(lambda: remove_old_tasks())
+    bind_control_enqueue_button(block)
 
     if getattr(shared.opts, "queue_ui_placement", "") == ui_placement_append_to_main and block:
         with block:
@@ -783,3 +950,4 @@ if getattr(shared.opts, "queue_ui_placement", "") != ui_placement_append_to_main
 
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_app_started(on_app_started)
+script_callbacks.on_after_component(after_component_control)

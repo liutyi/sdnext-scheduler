@@ -58,6 +58,7 @@ declare global {
   function submit_img2img(...args: any[]): any[];
   function submit_enqueue(...args: any[]): any[];
   function submit_enqueue_img2img(...args: any[]): any[];
+  function submit_enqueue_control(...args: any[]): any[];
   function agent_scheduler_status_filter_changed(value: string): void;
   function appendContextMenuOption(selector: string, label: string, callback: () => void): void;
   function modalSaveImage(event: Event): void;
@@ -344,9 +345,9 @@ function showTaskProgress(task_id: string, type: string | undefined, callback: (
 }
 
 function initQueueHandler() {
-  const getUiCheckpoint = (is_img2img: boolean) => {
+  const getUiCheckpoint = (tab: 'txt2img' | 'img2img' | 'control') => {
     const enqueue_wrapper_model = gradioApp().querySelector<HTMLInputElement>(
-      `#${is_img2img ? 'img2img_enqueue_wrapper' : 'txt2img_enqueue_wrapper'} input`
+      `#${tab}_enqueue_wrapper input`
     );
     if (enqueue_wrapper_model != null) {
       const checkpoint = enqueue_wrapper_model.value;
@@ -364,7 +365,7 @@ function initQueueHandler() {
   const btnEnqueue = gradioApp().querySelector<HTMLButtonElement>('#txt2img_enqueue')!;
   window.submit_enqueue = (...args) => {
     const res = create_submit_args(args);
-    res[0] = getUiCheckpoint(false);
+    res[0] = getUiCheckpoint('txt2img');
     res[1] = randomId();
     window.randomId = window.origRandomId;
 
@@ -386,7 +387,7 @@ function initQueueHandler() {
   const btnImg2ImgEnqueue = gradioApp().querySelector<HTMLButtonElement>('#img2img_enqueue')!;
   window.submit_enqueue_img2img = (...args) => {
     const res = create_submit_args(args);
-    res[0] = getUiCheckpoint(true);
+    res[0] = getUiCheckpoint('img2img');
     res[1] = randomId();
     res[2] = get_tab_index('mode_img2img');
     window.randomId = window.origRandomId;
@@ -395,6 +396,26 @@ function initQueueHandler() {
       btnImg2ImgEnqueue.innerText = 'Queued';
       setTimeout(() => {
         btnImg2ImgEnqueue.innerText = 'Enqueue';
+        if (!sharedStore.getState().uiAsTab) {
+          if (sharedStore.getState().selectedTab === 'pending') {
+            pendingStore.refresh();
+          }
+        }
+      }, 1000);
+    }
+
+    return res;
+  };
+
+  const btnControlEnqueue = gradioApp().querySelector<HTMLButtonElement>('#control_enqueue');
+  window.submit_enqueue_control = (...args) => {
+    const res = create_submit_args(args);
+    res[0] = getUiCheckpoint('control');
+    res[1] = randomId();
+    window.randomId = window.origRandomId;
+
+    if (btnControlEnqueue != null) {
+      setTimeout(() => {
         if (!sharedStore.getState().uiAsTab) {
           if (sharedStore.getState().selectedTab === 'pending') {
             pendingStore.refresh();
