@@ -59,6 +59,7 @@ declare global {
   function submit_enqueue(...args: any[]): any[];
   function submit_enqueue_img2img(...args: any[]): any[];
   function submit_enqueue_control(...args: any[]): any[];
+  function submit_enqueue_video(...args: any[]): any[];
   function agent_scheduler_status_filter_changed(value: string): void;
   function appendContextMenuOption(selector: string, label: string, callback: () => void): void;
   function modalSaveImage(event: Event): void;
@@ -151,8 +152,24 @@ const sharedGridOptions: GridOptions<Task> = {
           cellDataType: 'text',
           minWidth: 150,
           maxWidth: 300,
-          valueFormatter: ({ value }: ValueFormatterParams<Task, string | undefined>) =>
-            value ?? 'System',
+          editable: (params: ValueFormatterParams<Task, string | undefined>) => {
+            const isVideoTask = params.data?.type === 'video_text' || !!params.data?.params?.video_model;
+            return !isVideoTask;
+          },
+          valueFormatter: ({ data, value }: ValueFormatterParams<Task, string | undefined>) => {
+            const isVideoTask = data?.type === 'video_text';
+            const rawModel = data?.params?.video_model ?? null;
+            const rawEngine = data?.params?.video_engine ?? null;
+            const model = rawModel && rawModel !== 'None' ? rawModel : null;
+            const engine = rawEngine && rawEngine !== 'None' ? rawEngine : null;
+            if (isVideoTask) {
+              if (model) {
+                return `${engine ?? 'Video'}: ${model}`;
+              }
+              return 'Video: (unset)';
+            }
+            return value ?? 'System';
+          },
           cellEditor: 'agSelectCellEditor',
           cellEditorParams: () => ({ values: checkpoints }),
         },
@@ -345,7 +362,7 @@ function showTaskProgress(task_id: string, type: string | undefined, callback: (
 }
 
 function initQueueHandler() {
-  const getUiCheckpoint = (tab: 'txt2img' | 'img2img' | 'control') => {
+  const getUiCheckpoint = (tab: 'txt2img' | 'img2img' | 'control' | 'video') => {
     const enqueue_wrapper_model = gradioApp().querySelector<HTMLInputElement>(
       `#${tab}_enqueue_wrapper input`
     );
@@ -360,6 +377,54 @@ function initQueueHandler() {
       '#setting_sd_model_checkpoint input'
     );
     return setting_sd_model?.value ?? 'Current Checkpoint';
+  };
+  const getInputValue = (elemId: string) => {
+    const el = gradioApp().querySelector<HTMLInputElement>(`#${elemId} input`);
+    return el?.value ?? null;
+  };
+  const getSliderValue = (elemId: string) => {
+    const el = gradioApp().querySelector<HTMLInputElement>(`#${elemId} input`);
+    if (!el) return null;
+    const value = Number.parseFloat(el.value);
+    return Number.isNaN(value) ? null : value;
+  };
+  const getGradioConfig = () => (window as any).gradio_config as {
+    components?: Array<{ id?: number; props?: { elem_id?: string } }>;
+    dependencies?: Array<{ targets?: unknown; inputs?: number[] }>;
+  };
+  const getComponentIdByElemId = (elemId: string) => {
+    const config = getGradioConfig();
+    const components = config?.components ?? [];
+    const component = components.find((comp) => comp?.props?.elem_id === elemId);
+    return component?.id ?? null;
+  };
+  const getDependencyInputsForTarget = (targetElemId: string) => {
+    const config = getGradioConfig();
+    const dependencies = config?.dependencies ?? [];
+    const targetId = getComponentIdByElemId(targetElemId);
+    if (targetId == null) return null;
+    const matchesTarget = (targets: unknown) => {
+      if (Array.isArray(targets)) {
+        return targets.some((target) => {
+          if (Array.isArray(target)) return target[0] === targetId;
+          return target === targetId;
+        });
+      }
+      return targets === targetId;
+    };
+    const dependency = dependencies.find((dep) => matchesTarget(dep?.targets));
+    return dependency?.inputs ?? null;
+  };
+  const getVideoInputIndex = (inputElemId: string) => {
+    const inputs =
+      getDependencyInputsForTarget('video_enqueue') ??
+      getDependencyInputsForTarget('video_generate_btn') ??
+      getDependencyInputsForTarget('video_generate');
+    if (!inputs) return null;
+    const inputId = getComponentIdByElemId(inputElemId);
+    if (inputId == null) return null;
+    const index = inputs.indexOf(inputId);
+    return index === -1 ? null : index;
   };
 
   const btnEnqueue = gradioApp().querySelector<HTMLButtonElement>('#txt2img_enqueue')!;
@@ -415,6 +480,50 @@ function initQueueHandler() {
     window.randomId = window.origRandomId;
 
     if (btnControlEnqueue != null) {
+      setTimeout(() => {
+        if (!sharedStore.getState().uiAsTab) {
+          if (sharedStore.getState().selectedTab === 'pending') {
+            pendingStore.refresh();
+          }
+        }
+      }, 1000);
+    }
+
+    return res;
+  };
+
+  const btnVideoEnqueue = gradioApp().querySelector<HTMLButtonElement>('#video_enqueue');
+  window.submit_enqueue_video = (...args) => {
+    const res = create_submit_args(args);
+    res[0] = getUiCheckpoint('video');
+    res[1] = randomId();
+    window.randomId = window.origRandomId;
+    const videoEngine = getInputValue('video_engine');
+    const videoModel = getInputValue('video_model');
+    const engineIndex = getVideoInputIndex('video_engine');
+    const modelIndex = getVideoInputIndex('video_model');
+    const stepsIndex = getVideoInputIndex('video_steps');
+    if (engineIndex != null && engineIndex >= 0) {
+      if (engineIndex >= res.length) res.length = engineIndex + 1;
+      res[engineIndex] = videoEngine;
+    }
+    if (videoEngine === 'LTX Video') {
+      const ltxModel = getInputValue('ltx_model');
+      const ltxSteps = getSliderValue('ltx_steps');
+      if (modelIndex != null && modelIndex >= 0) {
+        if (modelIndex >= res.length) res.length = modelIndex + 1;
+        res[modelIndex] = ltxModel;
+      }
+      if (stepsIndex != null && stepsIndex >= 0) {
+        if (stepsIndex >= res.length) res.length = stepsIndex + 1;
+        res[stepsIndex] = ltxSteps;
+      }
+    } else if (modelIndex != null && modelIndex >= 0) {
+      if (modelIndex >= res.length) res.length = modelIndex + 1;
+      res[modelIndex] = videoModel;
+    }
+
+    if (btnVideoEnqueue != null) {
       setTimeout(() => {
         if (!sharedStore.getState().uiAsTab) {
           if (sharedStore.getState().selectedTab === 'pending') {

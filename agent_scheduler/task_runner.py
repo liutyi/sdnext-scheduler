@@ -13,7 +13,7 @@ from typing import Any, Callable, Union, Optional, List, Dict
 from fastapi import FastAPI
 from PIL import Image
 
-from modules import progress, shared, script_callbacks
+from modules import progress, shared, script_callbacks, call_queue
 from modules.call_queue import queue_lock, wrap_gradio_call
 from modules.txt2img import txt2img
 from modules.img2img import img2img
@@ -71,6 +71,14 @@ class ControlTaskArgs(BaseModel):
     args_order: List[Optional[str]]
     args_values: List[Any]
     control_mode: str
+    checkpoint: Optional[str] = None
+
+
+class VideoTaskArgs(BaseModel):
+    named_args: Dict[str, Any]
+    args_order: List[Optional[str]]
+    args_values: List[Any]
+    video_mode: str
     checkpoint: Optional[str] = None
 
 
@@ -292,6 +300,21 @@ class TaskRunner:
             checkpoint=parsed.get("checkpoint", None),
         )
 
+    def parse_video_task_args(self, task: Task):
+        parsed: Dict[str, Any] = json.loads(task.params)
+        named_args = parsed.get("args", None)
+        args_order = parsed.get("args_order", None)
+        args_values = parsed.get("args_values", None)
+        if named_args is None or args_order is None or args_values is None:
+            raise ValueError("Video task args missing; re-enqueue the task.")
+        return VideoTaskArgs(
+            named_args=named_args,
+            args_order=args_order,
+            args_values=args_values,
+            video_mode=parsed.get("video_mode", "text_only"),
+            checkpoint=parsed.get("checkpoint", None),
+        )
+
     def register_ui_task(
         self,
         task_id: str,
@@ -394,6 +417,44 @@ class TaskRunner:
 
         return task
 
+    def register_video_task(
+        self,
+        task_id: str,
+        named_args: Dict[str, Any],
+        args_order: List[Optional[str]],
+        args_values: List[Any],
+        checkpoint: str = None,
+        task_name: str = None,
+        request: gr.Request = None,
+        video_mode: str = "text_only",
+    ):
+        progress.add_task_to_queue(task_id)
+
+        params = json.dumps(
+            {
+                "args": named_args,
+                "args_order": args_order,
+                "args_values": args_values,
+                "video_mode": video_mode,
+                "checkpoint": checkpoint,
+                "is_ui": True,
+            }
+        )
+
+        task = Task(
+            id=task_id,
+            name=task_name,
+            type="video_text",
+            params=params,
+            script_params=b"",
+        )
+        task_manager.add_task(task)
+
+        self.__run_callbacks("task_registered", task_id, is_img2img=False, is_ui=True, args=params)
+        self.__total_pending_tasks += 1
+
+        return task
+
     def execute_task(self, task: Task, get_next_task: Callable[[], Task]):
         if self.__control_ui_state is None:
             from modules import ui_control_helpers as control_helpers
@@ -414,6 +475,13 @@ class TaskRunner:
 
                 if task.type == "control":
                     task_args = self.parse_control_task_args(task)
+                    task_meta = {
+                        "is_img2img": False,
+                        "is_ui": True,
+                        "task": task,
+                    }
+                elif task.type == "video_text":
+                    task_args = self.parse_video_task_args(task)
                     task_meta = {
                         "is_img2img": False,
                         "is_ui": True,
@@ -479,6 +547,12 @@ class TaskRunner:
                                 "images": self.__saved_images_path.copy(),
                                 "geninfo": None,
                                 "result_txt": res.get("result_txt") if isinstance(res, dict) else None,
+                            }
+                        elif task.type == "video_text":
+                            result = {
+                                "images": self.__saved_images_path.copy(),
+                                "geninfo": res.get("geninfo") if isinstance(res, dict) else None,
+                                "video": res.get("video") if isinstance(res, dict) else None,
                             }
                         else:
                             geninfo = json.loads(res)
@@ -560,9 +634,17 @@ class TaskRunner:
             self.__current_thread.daemon = True
             self.__current_thread.start()
 
-    def __execute_task(self, task_id: str, is_img2img: bool, task_args: ParsedTaskArgs, task_type: str = None):
+    def __execute_task(
+        self,
+        task_id: str,
+        is_img2img: bool,
+        task_args: Union[ParsedTaskArgs, ControlTaskArgs, VideoTaskArgs],
+        task_type: str = None,
+    ):
         if task_type == "control":
             return self.__execute_control_task(task_id, task_args)
+        if task_type == "video_text":
+            return self.__execute_video_task(task_id, task_args)
 
         if task_args.is_ui:
             ui_args = map_named_args_to_ui_task_args_list(task_args.named_args, task_args.script_args, is_img2img)
@@ -621,8 +703,13 @@ class TaskRunner:
         control_helpers.input_mask = None
 
         args = list(task_args.args_values)
+        arg_key_counts = {}
+        for key in task_args.args_order:
+            if key:
+                arg_key_counts[key] = arg_key_counts.get(key, 0) + 1
+
         for idx, key in enumerate(task_args.args_order):
-            if key and key in task_args.named_args:
+            if key and arg_key_counts.get(key, 0) == 1 and key in task_args.named_args:
                 args[idx] = task_args.named_args[key]
         if args:
             args[0] = 0
@@ -667,6 +754,65 @@ class TaskRunner:
             result_txt = res[4]
 
         return {"result_txt": result_txt}
+
+    def __execute_video_task(self, task_id: str, task_args: VideoTaskArgs):
+        from modules.video_models import video_run
+
+        if task_args.checkpoint is not None:
+            log.warning(
+                "[AgentScheduler] Video task checkpoint override is not applied; "
+                f'requested="{task_args.checkpoint}"'
+            )
+
+        filtered_order = []
+        filtered_values = []
+        for idx, key in enumerate(task_args.args_order):
+            if key in ("ltx_model", "ltx_steps"):
+                continue
+            filtered_order.append(key)
+            filtered_values.append(task_args.args_values[idx] if idx < len(task_args.args_values) else None)
+
+        args = list(filtered_values)
+        for idx, key in enumerate(filtered_order):
+            if key and key in task_args.named_args:
+                args[idx] = task_args.named_args[key]
+
+        sampler_index = task_args.named_args.get("video_sampling")
+        if isinstance(sampler_index, float):
+            sampler_index = int(sampler_index)
+            for idx, key in enumerate(filtered_order):
+                if key == "video_sampling":
+                    args[idx] = sampler_index
+
+
+        func = call_queue.wrap_gradio_gpu_call(
+            video_run.generate,
+            extra_outputs=[gr.update(), gr.update(), gr.update(), gr.update()],
+            name="Video",
+        )
+
+        try:
+            res = func(*args)
+        except Exception as e:
+            if "CUDA out of memory" in str(e):
+                return OutOfMemoryError()
+            return e
+
+        if isinstance(res, Exception):
+            return res
+
+        geninfo = None
+        video_path = None
+        if isinstance(res, (list, tuple)) and len(res) >= 3:
+            video_path = res[1]
+            geninfo = res[2]
+            if isinstance(geninfo, str):
+                try:
+                    geninfo = json.loads(geninfo)
+                except json.JSONDecodeError:
+                    geninfo = None
+
+        return {"video": video_path, "geninfo": geninfo}
 
     def __restore_control_ui_state(self):
         if self.__control_ui_state is None:
