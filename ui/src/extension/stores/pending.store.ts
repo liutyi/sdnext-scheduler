@@ -70,6 +70,7 @@ export const createPendingTasksStore = (initialState: PendingTasksState) => {
         .then(data => {
           setTimeout(() => {
             actions.refresh();
+            historyStore.refresh();
           }, 500);
           return data;
         });

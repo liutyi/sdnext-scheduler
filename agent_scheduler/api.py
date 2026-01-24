@@ -8,7 +8,7 @@ from uuid import uuid4
 from zipfile import ZipFile
 from pathlib import Path
 from secrets import compare_digest
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 from datetime import datetime, timezone
 from collections import defaultdict
 from gradio.routes import App
@@ -159,6 +159,84 @@ def regsiter_apis(app: App, task_runner: TaskRunner):
         return QueueTaskResponse(task_id=task_id)
 
     def format_task_args(task):
+        if task.type == "control":
+            try:
+                control_args = TaskRunner.instance.parse_control_task_args(task)
+            except ValueError:
+                return {
+                    "checkpoint": None,
+                    "prompt": "",
+                    "negative_prompt": "",
+                    "sampler_name": None,
+                    "steps": None,
+                    "cfg_scale": None,
+                    "width": None,
+                    "height": None,
+                    "n_iter": None,
+                    "batch_size": None,
+                    "control_mode": None,
+                }
+            args_map = control_args.named_args or {}
+            sampler_index = args_map.get("control_sampling", None)
+            if isinstance(sampler_index, float):
+                sampler_index = int(sampler_index)
+            sampler_name = None
+            if isinstance(sampler_index, int):
+                sd_samplers.set_samplers()
+                if 0 <= sampler_index < len(sd_samplers.samplers):
+                    sampler_name = sd_samplers.samplers[sampler_index].name
+            return {
+                "checkpoint": control_args.checkpoint,
+                "prompt": args_map.get("control_prompt", ""),
+                "negative_prompt": args_map.get("control_neg_prompt", ""),
+                "sampler_name": sampler_name,
+                "steps": args_map.get("control_steps", None),
+                "cfg_scale": args_map.get("control_cfg_scale", None),
+                "width": args_map.get("control_before_resize_width", None),
+                "height": args_map.get("control_before_resize_height", None),
+                "n_iter": args_map.get("control_batch_count", None),
+                "batch_size": args_map.get("control_batch_size", None),
+                "control_mode": control_args.control_mode,
+            }
+        if task.type == "video_text":
+            try:
+                video_args = TaskRunner.instance.parse_video_task_args(task)
+            except ValueError:
+                return {
+                    "checkpoint": None,
+                    "prompt": "",
+                    "negative_prompt": "",
+                    "sampler_name": None,
+                    "steps": None,
+                    "cfg_scale": None,
+                    "width": None,
+                    "height": None,
+                    "frames": None,
+                    "video_mode": None,
+                }
+            args_map = video_args.named_args or {}
+            sampler_index = args_map.get("video_sampling", None)
+            if isinstance(sampler_index, float):
+                sampler_index = int(sampler_index)
+            sampler_name = None
+            if isinstance(sampler_index, int):
+                sd_samplers.set_samplers()
+                if 0 <= sampler_index < len(sd_samplers.samplers):
+                    sampler_name = sd_samplers.samplers[sampler_index].name
+            return {
+                "checkpoint": None,
+                "prompt": args_map.get("video_prompt", ""),
+                "negative_prompt": args_map.get("video_neg_prompt", ""),
+                "sampler_name": sampler_name,
+                "steps": args_map.get("video_steps", None),
+                "cfg_scale": args_map.get("video_guidance_scale", None),
+                "width": args_map.get("video_width", None),
+                "height": args_map.get("video_height", None),
+                "frames": args_map.get("video_frames", None),
+                "video_mode": video_args.video_mode,
+                "video_engine": args_map.get("video_engine", None),
+                "video_model": args_map.get("video_model", None),
+            }
         task_args = TaskRunner.instance.parse_task_args(task, deserialization=False)
         named_args = task_args.named_args
         named_args["checkpoint"] = task_args.checkpoint
@@ -297,10 +375,88 @@ def regsiter_apis(app: App, task_runner: TaskRunner):
 
         if body.checkpoint or body.params:
             params: Dict = json.loads(task.params)
-            if body.checkpoint is not None:
+            if task.type == "control":
+                named_args = params.get("args", {})
+                args_order = params.get("args_order", [])
+                args_values = params.get("args_values", [])
+
+                def set_arg_value(key: str, value: Any):
+                    if key in args_order:
+                        idx = args_order.index(key)
+                        if len(args_values) <= idx:
+                            args_values.extend([None] * (idx + 1 - len(args_values)))
+                        args_values[idx] = value
+
+                if body.params:
+                    if "prompt" in body.params:
+                        named_args["control_prompt"] = body.params["prompt"]
+                        set_arg_value("control_prompt", body.params["prompt"])
+                    if "negative_prompt" in body.params:
+                        named_args["control_neg_prompt"] = body.params["negative_prompt"]
+                        set_arg_value("control_neg_prompt", body.params["negative_prompt"])
+                    if "steps" in body.params:
+                        named_args["control_steps"] = body.params["steps"]
+                        set_arg_value("control_steps", body.params["steps"])
+                    if "cfg_scale" in body.params:
+                        named_args["control_cfg_scale"] = body.params["cfg_scale"]
+                        set_arg_value("control_cfg_scale", body.params["cfg_scale"])
+                    sampler_name = body.params.get("sampler_name", None)
+                    if sampler_name is not None:
+                        sd_samplers.set_samplers()
+                        sampler_index = next(
+                            (i for i, s in enumerate(sd_samplers.samplers) if s.name == sampler_name),
+                            0,
+                        )
+                        named_args["control_sampling"] = sampler_index
+                        set_arg_value("control_sampling", sampler_index)
+                params["args"] = named_args
+                params["args_values"] = args_values
+            elif task.type == "video_text":
+                named_args = params.get("args", {})
+                args_order = params.get("args_order", [])
+                args_values = params.get("args_values", [])
+
+                def set_arg_value(key: str, value: Any):
+                    if key in args_order:
+                        idx = args_order.index(key)
+                        if len(args_values) <= idx:
+                            args_values.extend([None] * (idx + 1 - len(args_values)))
+                        args_values[idx] = value
+
+                if body.params:
+                    if "prompt" in body.params:
+                        named_args["video_prompt"] = body.params["prompt"]
+                        set_arg_value("video_prompt", body.params["prompt"])
+                    if "negative_prompt" in body.params:
+                        named_args["video_neg_prompt"] = body.params["negative_prompt"]
+                        set_arg_value("video_neg_prompt", body.params["negative_prompt"])
+                    if "steps" in body.params:
+                        named_args["video_steps"] = body.params["steps"]
+                        set_arg_value("video_steps", body.params["steps"])
+                    if "cfg_scale" in body.params:
+                        named_args["video_guidance_scale"] = body.params["cfg_scale"]
+                        set_arg_value("video_guidance_scale", body.params["cfg_scale"])
+                    sampler_name = body.params.get("sampler_name", None)
+                    if sampler_name is not None:
+                        sd_samplers.set_samplers()
+                        sampler_index = next(
+                            (i for i, s in enumerate(sd_samplers.samplers) if s.name == sampler_name),
+                            0,
+                        )
+                        named_args["video_sampling"] = sampler_index
+                        set_arg_value("video_sampling", sampler_index)
+                params["args"] = named_args
+                params["args_values"] = args_values
+            else:
+                if body.checkpoint is not None:
+                    params["checkpoint"] = body.checkpoint
+                if body.params is not None:
+                    params["args"].update(body.params)
+
+            if body.checkpoint is not None and task.type == "control":
                 params["checkpoint"] = body.checkpoint
-            if body.checkpoint is not None:
-                params["args"].update(body.params)
+            if body.checkpoint is not None and task.type == "video_text":
+                params["checkpoint"] = body.checkpoint
 
             task.params = json.dumps(params)
             should_save = True

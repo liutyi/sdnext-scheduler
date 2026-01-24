@@ -3,7 +3,7 @@ import json
 import gradio as gr
 from PIL import Image
 from uuid import uuid4
-from typing import List
+from typing import List, Optional
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -67,6 +67,18 @@ task_history_retenion_map = {
 }
 
 init_db()
+
+control_generate_button = None
+control_enqueue_row = None
+control_checkpoint_dropdown = None
+control_submit_button = None
+video_generate_button = None
+video_generate_btn = None
+video_enqueue_row = None
+video_checkpoint_dropdown = None
+video_submit_button = None
+ltx_steps_component = None
+ltx_model_component = None
 
 
 class Script(scripts.Script):
@@ -234,6 +246,365 @@ class Script(scripts.Script):
             task_runner.execute_pending_tasks_threading()
 
         return f
+
+
+def add_control_enqueue_button():
+    global control_enqueue_row, control_checkpoint_dropdown, control_submit_button
+
+    if control_enqueue_row is not None:
+        return
+
+    with gr.Row(elem_id="control_enqueue_wrapper") as row:
+        control_enqueue_row = row
+        hide_checkpoint = getattr(shared.opts, "queue_button_hide_checkpoint", True)
+        control_checkpoint_dropdown = gr.Dropdown(
+            choices=get_checkpoint_choices(),
+            value=checkpoint_current,
+            show_label=False,
+            interactive=True,
+            visible=not hide_checkpoint,
+        )
+        if not hide_checkpoint:
+            create_refresh_button(
+                control_checkpoint_dropdown,
+                refresh_checkpoints,
+                lambda: {"choices": get_checkpoint_choices()},
+                "refresh_control_checkpoint",
+            )
+        control_submit_button = gr.Button(
+            "Enqueue",
+            elem_id="control_enqueue",
+            elem_classes=["sd-button"],
+            variant="primary",
+            tooltip="Enqueue",
+        )
+
+
+def add_video_enqueue_button():
+    global video_enqueue_row, video_checkpoint_dropdown, video_submit_button
+
+    if video_enqueue_row is not None:
+        return
+
+    with gr.Row(elem_id="video_enqueue_wrapper") as row:
+        video_enqueue_row = row
+        hide_checkpoint = getattr(shared.opts, "queue_button_hide_checkpoint", True)
+        video_checkpoint_dropdown = gr.Dropdown(
+            choices=get_checkpoint_choices(),
+            value=checkpoint_current,
+            show_label=False,
+            interactive=True,
+            visible=not hide_checkpoint,
+        )
+        if not hide_checkpoint:
+            create_refresh_button(
+                video_checkpoint_dropdown,
+                refresh_checkpoints,
+                lambda: {"choices": get_checkpoint_choices()},
+                "refresh_video_checkpoint",
+            )
+        video_submit_button = gr.Button(
+            "Enqueue",
+            elem_id="video_enqueue",
+            elem_classes=["sd-button"],
+            variant="primary",
+            tooltip="Enqueue",
+        )
+
+
+def after_component_control(component, **_kwargs):
+    global control_generate_button
+
+    if component.elem_id != "control_generate":
+        return
+
+    control_generate_button = component
+    add_control_enqueue_button()
+
+
+def after_component_video(component, **_kwargs):
+    global video_generate_button, video_generate_btn, ltx_steps_component, ltx_model_component
+
+    if component.elem_id == "ltx_model":
+        ltx_model_component = component
+    if component.elem_id == "ltx_steps":
+        ltx_steps_component = component
+
+    if component.elem_id == "video_generate_btn":
+        video_generate_btn = component
+        return
+
+    if component.elem_id != "video_generate":
+        return
+
+    video_generate_button = component
+    add_video_enqueue_button()
+
+
+def bind_control_enqueue_button(root: gr.Blocks):
+    if control_generate_button is None or control_submit_button is None:
+        log.debug("[AgentScheduler] control enqueue bind skipped (missing button)")
+        return
+
+    dependencies = [
+        x
+        for x in root.dependencies
+        if x["trigger"] == "click" and control_generate_button._id in x["targets"]
+    ]
+    if len(dependencies) == 0:
+        log.debug("[AgentScheduler] control enqueue bind skipped (no dependencies)")
+        return
+
+    dependency = max(dependencies, key=lambda d: len(d["inputs"]))
+    fn_block = next(fn for fn in root.fns if compare_components_with_ids(fn.inputs, dependency["inputs"]))
+    inputs = fn_block.inputs.copy()
+    inputs.insert(0, control_checkpoint_dropdown)
+
+    def find_input_index(elem_id: str) -> Optional[int]:
+        for idx, comp in enumerate(inputs):
+            if getattr(comp, "elem_id", None) == elem_id:
+                return idx
+        return None
+
+    input_start_idx = find_input_index("control_input_type")
+    input_ids = [getattr(comp, "elem_id", None) for comp in inputs]
+
+    with root:
+        control_submit_button.click(
+            fn=wrap_register_control_task(
+                input_start_idx=input_start_idx,
+                ui_input_ids=input_ids,
+            ),
+            _js="submit_enqueue_control",
+            inputs=inputs,
+            outputs=None,
+            show_progress=False,
+        )
+
+
+def bind_video_enqueue_button(root: gr.Blocks):
+    if video_generate_btn is None or video_submit_button is None:
+        log.debug("[AgentScheduler] video enqueue bind skipped (missing button)")
+        return
+
+    dependencies = [
+        x
+        for x in root.dependencies
+        if x["trigger"] == "click" and video_generate_btn._id in x["targets"]
+    ]
+    if len(dependencies) == 0:
+        log.debug("[AgentScheduler] video enqueue bind skipped (no dependencies)")
+        return
+
+    dependency = max(dependencies, key=lambda d: len(d["inputs"]))
+    fn_block = next(fn for fn in root.fns if compare_components_with_ids(fn.inputs, dependency["inputs"]))
+    inputs = fn_block.inputs.copy()
+    inputs.insert(0, video_checkpoint_dropdown)
+
+    def append_input(component):
+        if component is None:
+            return
+        elem_id = getattr(component, "elem_id", None)
+        if not elem_id:
+            return
+        if any(getattr(comp, "elem_id", None) == elem_id for comp in inputs):
+            return
+        inputs.append(component)
+
+    append_input(ltx_model_component)
+    append_input(ltx_steps_component)
+
+    input_ids = [getattr(comp, "elem_id", None) for comp in inputs]
+    if "video_engine" not in input_ids:
+        log.debug("[AgentScheduler] video enqueue bind skipped (video_engine missing)")
+        return
+
+    with root:
+        video_submit_button.click(
+            fn=wrap_register_video_task(ui_input_ids=input_ids[1:]),
+            _js="submit_enqueue_video",
+            inputs=inputs,
+            outputs=None,
+            show_progress=False,
+        )
+
+
+def wrap_register_control_task(
+    input_start_idx: Optional[int] = None,
+    ui_input_ids: Optional[List[Optional[str]]] = None,
+):
+    def f(request: gr.Request, *args):
+        if len(args) < 2:
+            raise Exception("Invalid call")
+
+        checkpoint: str = args[0]
+        task_id = args[1]
+
+        if input_start_idx is None:
+            raise ValueError("Control enqueue input alignment failed: control_input_type not found")
+        start_idx = input_start_idx
+
+        state_idx = start_idx - 2
+        active_tab_idx = start_idx - 1
+
+        state = args[state_idx] if len(args) > state_idx and state_idx >= 0 else ""
+        active_tab = args[active_tab_idx] if len(args) > active_tab_idx and active_tab_idx >= 0 else "control"
+        if not active_tab:
+            active_tab = "control"
+
+        control_args = list(args[start_idx:]) if len(args) > start_idx else []
+        control_arg_ids = (
+            ui_input_ids[start_idx:] if ui_input_ids is not None and len(ui_input_ids) > start_idx else []
+        )
+        named_args = {
+            elem_id: value
+            for elem_id, value in zip(control_arg_ids, control_args)
+            if elem_id
+        }
+        if named_args:
+            named_args["control_input_type"] = 0
+        for key in ("control_sampling", "control_sampling_alt"):
+            value = named_args.get(key)
+            if isinstance(value, float):
+                named_args[key] = int(value)
+
+        task_name = None
+        if task_id == queue_with_every_checkpoints:
+            task_id = str(uuid4())
+            checkpoint = list_checkpoint_tiles()
+        else:
+            if not task_id.startswith("task("):
+                task_name = task_id
+                task_id = str(uuid4())
+
+            if checkpoint is None or checkpoint == "" or checkpoint == checkpoint_current:
+                checkpoint = [shared.sd_model.sd_checkpoint_info.title]
+            elif checkpoint == checkpoint_runtime:
+                checkpoint = [None]
+            elif checkpoint.endswith(" checkpoints)"):
+                checkpoint_dir = " ".join(checkpoint.split(" ")[0:-2])
+                checkpoint = list(filter(lambda c: c.startswith(checkpoint_dir), list_checkpoint_tiles()))
+            else:
+                checkpoint = [checkpoint]
+
+        for i, c in enumerate(checkpoint):
+            t_id = task_id if i == 0 else f"{task_id}.{i}"
+            task_runner.register_control_task(
+                t_id,
+                state,
+                active_tab,
+                named_args,
+                control_arg_ids,
+                control_args,
+                checkpoint=c,
+                task_name=task_name,
+                request=request,
+                control_mode="text_only",
+            )
+
+        task_runner.execute_pending_tasks_threading()
+
+    return f
+
+
+def wrap_register_video_task(ui_input_ids: Optional[List[Optional[str]]] = None):
+    def f(request: gr.Request, *args):
+        if len(args) < 2:
+            raise Exception("Invalid call")
+
+        checkpoint: str = args[0]
+        task_id = args[1]
+
+        if ui_input_ids is None:
+            raise ValueError("Video enqueue input alignment failed: missing inputs")
+        if "video_engine" not in ui_input_ids:
+            raise ValueError("Video enqueue input alignment failed: video_engine not found")
+
+        args_values = list(args[1:])
+        args_order = ui_input_ids
+        named_args = {
+            elem_id: value
+            for elem_id, value in zip(args_order, args_values)
+            if elem_id
+        }
+
+        def set_arg_value(key: str, value):
+            if key in args_order:
+                idx = args_order.index(key)
+                if len(args_values) <= idx:
+                    args_values.extend([None] * (idx + 1 - len(args_values)))
+                args_values[idx] = value
+
+        named_args["video_image"] = None
+        named_args["video_last"] = None
+        if "video_denoising_strength" not in named_args or named_args["video_denoising_strength"] is None:
+            named_args["video_denoising_strength"] = 0.8
+
+        set_arg_value("video_image", None)
+        set_arg_value("video_last", None)
+        set_arg_value("video_denoising_strength", named_args["video_denoising_strength"])
+
+        if named_args.get("video_engine") == "LTX Video":
+            generic_model = named_args.get("video_model")
+            ltx_model = named_args.get("ltx_model")
+            has_generic = generic_model not in (None, "", "None")
+            has_ltx = ltx_model not in (None, "", "None")
+            if not has_generic and not has_ltx:
+                raise ValueError("LTX model not selected. Set either the main model or the LTX model.")
+            if has_ltx and has_generic and generic_model != ltx_model:
+                log.warning(
+                    "[AgentScheduler] Both LTX and main video model are set; "
+                    "using LTX model for enqueue."
+                )
+            if has_ltx:
+                named_args["video_model"] = ltx_model
+                set_arg_value("video_model", ltx_model)
+
+            ltx_steps = named_args.get("ltx_steps")
+            if ltx_steps is not None:
+                named_args["video_steps"] = int(ltx_steps) if isinstance(ltx_steps, float) else ltx_steps
+                set_arg_value("video_steps", named_args["video_steps"])
+
+        sampler_index = named_args.get("video_sampling")
+        if isinstance(sampler_index, float):
+            named_args["video_sampling"] = int(sampler_index)
+            set_arg_value("video_sampling", int(sampler_index))
+
+        task_name = None
+        if task_id == queue_with_every_checkpoints:
+            task_id = str(uuid4())
+            checkpoint = list_checkpoint_tiles()
+        else:
+            if not task_id.startswith("task("):
+                task_name = task_id
+                task_id = str(uuid4())
+
+            if checkpoint is None or checkpoint == "" or checkpoint == checkpoint_current:
+                checkpoint = [shared.sd_model.sd_checkpoint_info.title]
+            elif checkpoint == checkpoint_runtime:
+                checkpoint = [None]
+            elif checkpoint.endswith(" checkpoints)"):
+                checkpoint_dir = " ".join(checkpoint.split(" ")[0:-2])
+                checkpoint = list(filter(lambda c: c.startswith(checkpoint_dir), list_checkpoint_tiles()))
+            else:
+                checkpoint = [checkpoint]
+
+        for i, c in enumerate(checkpoint):
+            t_id = task_id if i == 0 else f"{task_id}.{i}"
+            task_runner.register_video_task(
+                t_id,
+                named_args,
+                args_order,
+                args_values,
+                checkpoint=c,
+                task_name=task_name,
+                request=request,
+                video_mode="text_only",
+            )
+
+        task_runner.execute_pending_tasks_threading()
+
+    return f
 
 
 def get_checkpoint_choices():
@@ -767,6 +1138,8 @@ def on_app_started(block: gr.Blocks, app):
     task_runner.execute_pending_tasks_threading()
     regsiter_apis(app, task_runner)
     task_runner.on_task_cleared(lambda: remove_old_tasks())
+    bind_control_enqueue_button(block)
+    bind_video_enqueue_button(block)
 
     if getattr(shared.opts, "queue_ui_placement", "") == ui_placement_append_to_main and block:
         with block:
@@ -783,3 +1156,5 @@ if getattr(shared.opts, "queue_ui_placement", "") != ui_placement_append_to_main
 
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_app_started(on_app_started)
+script_callbacks.on_after_component(after_component_control)
+script_callbacks.on_after_component(after_component_video)
