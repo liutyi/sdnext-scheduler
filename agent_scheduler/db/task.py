@@ -53,6 +53,10 @@ class Task(TaskModel):
 
     def __init__(self, **kwargs):
         priority = kwargs.pop("priority", int(datetime.now(timezone.utc).timestamp() * 1000))
+        # compatibility with SD.Next dev 2026-02-22 (Pydantic v2 strict)
+        kwargs.setdefault("position", 0)
+        kwargs.setdefault("result", None)
+        kwargs.setdefault("bookmarked", False)
         super().__init__(priority=priority, **kwargs)
 
     class Config(TaskModel.__config__):
