@@ -57,7 +57,6 @@ class Task(TaskModel):
         kwargs.setdefault("position", 0)
         kwargs.setdefault("result", None)
         kwargs.setdefault("bookmarked", False)
-        kwargs.setdefault("script_params", b"")
         super().__init__(priority=priority, **kwargs)
 
     class Config(TaskModel.__config__):
@@ -75,11 +74,7 @@ class Task(TaskModel):
             script_params=table.script_params,
             priority=table.priority,
             status=table.status,
-            #result=table.result,
-            # ChatGPT suggestion
-            result=json.loads(table.result)
-                if table.result and table.result.startswith("{")
-                else table.result,
+            result=table.result,
             bookmarked=table.bookmarked,
             created_at=table.created_at,
             updated_at=table.updated_at,
@@ -96,9 +91,7 @@ class Task(TaskModel):
             script_params=self.script_params,
             priority=self.priority,
             status=self.status,
-            # result=self.result,
-            # ChatGPT suggestion result maybe dict
-            result=json.dumps(self.result) if isinstance(self.result, (dict, list)) else self.result,
+            result=self.result,
             bookmarked=self.bookmarked,
         )
 
@@ -111,11 +104,7 @@ class Task(TaskModel):
             type=json_obj.get("type"),
             status=json_obj.get("status", TaskStatus.PENDING),
             params=json.dumps(json_obj.get("params")),
-            # script_params=base64.b64decode(json_obj.get("script_params")),
-            # ChatGPT suggestion script_params → b64decode(None) → crash.
-            script_params=base64.b64decode(json_obj["script_params"])
-                if json_obj.get("script_params")
-                else b"",
+            script_params=base64.b64decode(json_obj.get("script_params")),
             priority=json_obj.get("priority", int(datetime.now(timezone.utc).timestamp() * 1000)),
             result=json_obj.get("result", None),
             bookmarked=json_obj.get("bookmarked", False),
@@ -132,9 +121,7 @@ class Task(TaskModel):
             "type": self.type,
             "status": self.status,
             "params": json.loads(self.params),
-            # "script_params": base64.b64encode(self.script_params).decode("utf-8"),
-            # ChatGPT suggestion self.script_params == None → crash.
-            "script_params": base64.b64encode(self.script_params or b"").decode("utf-8"),
+            "script_params": base64.b64encode(self.script_params).decode("utf-8"),
             "priority": self.priority,
             "result": self.result,
             "bookmarked": self.bookmarked,
@@ -297,8 +284,7 @@ class TaskManager(BaseTableManager):
         try:
             current = session.get(TaskTable, task.id)
             if current is None:
-                # ChatGPT suggest to change id to task.id
-                raise Exception(f"Task with id {task.id} not found")
+                raise Exception(f"Task with id {id} not found")
 
             session.merge(task.to_table())
             session.commit()
