@@ -56,6 +56,7 @@ class Task(TaskModel):
         # compatibility with SD.Next dev 2026-02-22 (Pydantic v2 strict)
         kwargs.setdefault("position", 0)
         kwargs.setdefault("result", None)
+        kwargs.setdefault("name", None)
         kwargs.setdefault("bookmarked", False)
         super().__init__(priority=priority, **kwargs)
 
