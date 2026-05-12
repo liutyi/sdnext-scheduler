@@ -478,7 +478,7 @@ def serialize_api_task_args(
         args.override_settings = {}
 
     if checkpoint is not None:
-        checkpoint_info: CheckpointInfo = get_closet_checkpoint_match(checkpoint)
+        checkpoint_info: CheckpointInfo = get_closest_checkpoint_match(checkpoint)
         if not checkpoint_info:
             log.warning(f"Checkpoint {checkpoint} not found, use current system model")
         else:
