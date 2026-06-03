@@ -95,6 +95,7 @@ class TaskRunner:
         self.__saved_images_path: List[str] = []
         script_callbacks.on_image_saved(self.__on_image_saved)
         self.__control_ui_state = None
+        self.__last_task_type = None
 
         self.script_callbacks = {
             "task_registered": [],
@@ -503,7 +504,11 @@ class TaskRunner:
                 samples_save = shared.opts.samples_save
                 shared.opts.samples_save = True
 
+                if task.type != "video_text":
+                    self.__wait_for_model_ready()
+                self.__prepare_task_model(task.type)
                 res = self.__execute_task(task_id, is_img2img, task_args, task_type=task.type)
+                self.__last_task_type = task.type
 
                 # disable image saving
                 shared.opts.samples_save = samples_save
@@ -529,12 +534,14 @@ class TaskRunner:
                             TaskStatus.FAILED,
                             result=str(res) if res else None,
                         )
+                        log.info(f"[AgentScheduler] Task {task_id} finished: status=failed")
                         self.__run_callbacks("task_finished", task_id, status=TaskStatus.FAILED, **task_meta)
                 else:
                     is_interrupted = self.interrupted == task_id
                     if is_interrupted:
                         log.info(f"\n[AgentScheduler] Task {task.id} interrupted")
                         self.__update_task_state(task, TaskStatus.INTERRUPTED)
+                        log.info(f"[AgentScheduler] Task {task_id} finished: status=interrupted")
                         self.__run_callbacks(
                             "task_finished",
                             task_id,
@@ -566,6 +573,7 @@ class TaskRunner:
                             TaskStatus.DONE,
                             result=json.dumps(result),
                         )
+                        log.info(f"[AgentScheduler] Task {task_id} finished: status=done")
                         self.__run_callbacks(
                             "task_finished",
                             task_id,
@@ -657,6 +665,46 @@ class TaskRunner:
                 script_args=task_args.script_args,
                 **task_args.named_args,
             )
+
+    def __prepare_task_model(self, task_type: Optional[str]):
+        if task_type == "video_text":
+            self.__prepare_for_video_task()
+        else:
+            self.__prepare_for_image_task()
+
+    def __wait_for_model_ready(self, timeout: float = 120.0):
+        if shared.sd_model is not None and shared.sd_loaded and getattr(shared.sd_model, "sd_checkpoint_info", None) is not None:
+            return
+
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if shared.sd_model is not None and shared.sd_loaded and getattr(shared.sd_model, "sd_checkpoint_info", None) is not None:
+                return
+            time.sleep(0.5)
+
+        log.warning("[AgentScheduler] Model not ready after wait; continuing")
+
+    def __prepare_for_video_task(self):
+        if self.__last_task_type == "video_text":
+            return
+        try:
+            from modules.video_models import video_load
+        except Exception:
+            return
+        if video_load.loaded_model is not None:
+            video_load.loaded_model = None
+
+    def __prepare_for_image_task(self):
+        if self.__last_task_type != "video_text":
+            return
+        try:
+            from modules.video_models import video_load
+        except Exception:
+            video_load = None
+        if video_load is not None and video_load.loaded_model is not None:
+            video_load.loaded_model = None
+        from modules import sd_models
+        sd_models.reload_model_weights()
 
     def __execute_ui_task(self, task_id: str, is_img2img: bool, *args):
         func = wrap_gradio_call(img2img if is_img2img else txt2img, add_stats=True)
