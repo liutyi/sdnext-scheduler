@@ -503,24 +503,33 @@ function initQueueHandler() {
     const engineIndex = getVideoInputIndex('video_engine');
     const modelIndex = getVideoInputIndex('video_model');
     const stepsIndex = getVideoInputIndex('video_steps');
-    if (engineIndex != null && engineIndex >= 0) {
+    const isMeaningful = (value: unknown) => value != null && value !== '' && value !== 'None';
+    const getResValue = (index: number | null) =>
+      index == null || index < 0 || index >= res.length ? null : res[index];
+    const engineValue = isMeaningful(videoEngine) ? videoEngine : getResValue(engineIndex);
+    if (engineIndex != null && engineIndex >= 0 && isMeaningful(engineValue)) {
       if (engineIndex >= res.length) res.length = engineIndex + 1;
-      res[engineIndex] = videoEngine;
+      res[engineIndex] = engineValue;
     }
-    if (videoEngine === 'LTX Video') {
+    if (engineValue === 'LTX Video') {
       const ltxModel = getInputValue('ltx_model');
       const ltxSteps = getSliderValue('ltx_steps');
-      if (modelIndex != null && modelIndex >= 0) {
+      const ltxModelValue = isMeaningful(ltxModel) ? ltxModel : getResValue(modelIndex);
+      const ltxStepsValue = ltxSteps ?? getResValue(stepsIndex);
+      if (modelIndex != null && modelIndex >= 0 && isMeaningful(ltxModelValue)) {
         if (modelIndex >= res.length) res.length = modelIndex + 1;
-        res[modelIndex] = ltxModel;
+        res[modelIndex] = ltxModelValue;
       }
-      if (stepsIndex != null && stepsIndex >= 0) {
+      if (stepsIndex != null && stepsIndex >= 0 && ltxStepsValue != null) {
         if (stepsIndex >= res.length) res.length = stepsIndex + 1;
-        res[stepsIndex] = ltxSteps;
+        res[stepsIndex] = ltxStepsValue;
       }
-    } else if (modelIndex != null && modelIndex >= 0) {
-      if (modelIndex >= res.length) res.length = modelIndex + 1;
-      res[modelIndex] = videoModel;
+    } else {
+      const modelValue = isMeaningful(videoModel) ? videoModel : getResValue(modelIndex);
+      if (modelIndex != null && modelIndex >= 0 && isMeaningful(modelValue)) {
+        if (modelIndex >= res.length) res.length = modelIndex + 1;
+        res[modelIndex] = modelValue;
+      }
     }
 
     if (btnVideoEnqueue != null) {

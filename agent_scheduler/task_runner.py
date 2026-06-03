@@ -37,6 +37,7 @@ from .task_helpers import (
     encode_image_to_base64,
     serialize_img2img_image_args,
     deserialize_img2img_image_args,
+    deserialize_image,
     serialize_script_args,
     deserialize_script_args,
     serialize_api_task_args,
@@ -820,10 +821,33 @@ class TaskRunner:
             filtered_order.append(key)
             filtered_values.append(task_args.args_values[idx] if idx < len(task_args.args_values) else None)
 
+        log.debug(
+            "[AgentScheduler] video task args: order=%s values=%s has_init=%s has_last=%s mode=%s",
+            filtered_order,
+            len(filtered_values),
+            task_args.named_args.get("has_init_image"),
+            task_args.named_args.get("has_last_image"),
+            task_args.video_mode,
+        )
+
+        for idx, key in enumerate(filtered_order):
+            if key not in ("video_image", "video_last"):
+                continue
+            payload = filtered_values[idx]
+            if payload is not None:
+                log.debug("[AgentScheduler] video task deserialize %s type=%s", key, type(payload).__name__)
+                filtered_values[idx] = deserialize_image(payload)
+
         args = list(filtered_values)
         for idx, key in enumerate(filtered_order):
             if key and key in task_args.named_args:
                 args[idx] = task_args.named_args[key]
+
+        if task_args.named_args.get("has_init_image") or task_args.named_args.get("has_last_image"):
+            if "video_denoising_strength" not in task_args.named_args:
+                for idx, key in enumerate(filtered_order):
+                    if key == "video_denoising_strength" and args[idx] is None:
+                        args[idx] = 0.8
 
         sampler_index = task_args.named_args.get("video_sampling")
         if isinstance(sampler_index, float):

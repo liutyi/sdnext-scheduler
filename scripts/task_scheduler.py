@@ -1,6 +1,7 @@
 import os
 import json
 import threading
+import time
 import gradio as gr
 from PIL import Image
 from uuid import uuid4
@@ -8,7 +9,7 @@ from typing import List, Optional
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from modules import call_queue, shared, script_callbacks, scripts, ui_components
+from modules import call_queue, shared, script_callbacks, scripts, ui_components, modeldata
 from modules.shared import list_checkpoint_tiles, refresh_checkpoints
 from modules.cmd_args import parser
 from modules.ui import create_refresh_button
@@ -26,6 +27,7 @@ from agent_scheduler.task_runner import TaskRunner, get_instance
 from agent_scheduler.helpers import log, compare_components_with_ids, get_components_by_ids, is_macos
 from agent_scheduler.db import init as init_db, task_manager, TaskStatus
 from agent_scheduler.api import regsiter_apis
+from agent_scheduler.task_helpers import serialize_image
 
 is_sdnext = parser.description == "SD.Next"
 ToolButton = gr.Button if is_sdnext else ui_components.ToolButton
@@ -528,6 +530,11 @@ def wrap_register_video_task(ui_input_ids: Optional[List[Optional[str]]] = None)
             for elem_id, value in zip(args_order, args_values)
             if elem_id
         }
+        log.debug(
+            "[AgentScheduler] video enqueue args: ids=%s values=%s",
+            args_order,
+            len(args_values),
+        )
 
         def set_arg_value(key: str, value):
             if key in args_order:
@@ -536,14 +543,49 @@ def wrap_register_video_task(ui_input_ids: Optional[List[Optional[str]]] = None)
                     args_values.extend([None] * (idx + 1 - len(args_values)))
                 args_values[idx] = value
 
-        named_args["video_image"] = None
-        named_args["video_last"] = None
-        if "video_denoising_strength" not in named_args or named_args["video_denoising_strength"] is None:
-            named_args["video_denoising_strength"] = 0.8
+        init_idx = args_order.index("video_image") if "video_image" in args_order else None
+        last_idx = args_order.index("video_last") if "video_last" in args_order else None
 
-        set_arg_value("video_image", None)
-        set_arg_value("video_last", None)
-        set_arg_value("video_denoising_strength", named_args["video_denoising_strength"])
+        init_image = named_args.get("video_image")
+        last_image = named_args.get("video_last")
+        if init_idx is not None and init_image is None and len(args_values) > init_idx:
+            init_image = args_values[init_idx]
+        if last_idx is not None and last_image is None and len(args_values) > last_idx:
+            last_image = args_values[last_idx]
+
+        has_init = init_image is not None
+        has_last = last_image is not None
+        log.debug(
+            "[AgentScheduler] video enqueue images: init_idx=%s last_idx=%s has_init=%s has_last=%s init_type=%s last_type=%s",
+            init_idx,
+            last_idx,
+            has_init,
+            has_last,
+            type(init_image).__name__ if init_image is not None else None,
+            type(last_image).__name__ if last_image is not None else None,
+        )
+        named_args["has_init_image"] = has_init
+        named_args["has_last_image"] = has_last
+
+        if has_init:
+            init_image = serialize_image(init_image)
+            set_arg_value("video_image", init_image)
+        else:
+            set_arg_value("video_image", None)
+
+        if has_last:
+            last_image = serialize_image(last_image)
+            set_arg_value("video_last", last_image)
+        else:
+            set_arg_value("video_last", None)
+
+        named_args.pop("video_image", None)
+        named_args.pop("video_last", None)
+
+        if not has_init and not has_last:
+            if "video_denoising_strength" not in named_args or named_args["video_denoising_strength"] is None:
+                named_args["video_denoising_strength"] = 0.8
+            set_arg_value("video_denoising_strength", named_args["video_denoising_strength"])
 
         if named_args.get("video_engine") == "LTX Video":
             generic_model = named_args.get("video_model")
@@ -555,9 +597,11 @@ def wrap_register_video_task(ui_input_ids: Optional[List[Optional[str]]] = None)
             if has_ltx and has_generic and generic_model != ltx_model:
                 log.warning(
                     "[AgentScheduler] Both LTX and main video model are set; "
-                    "using LTX model for enqueue."
+                    "keeping main model selection and syncing LTX model."
                 )
-            if has_ltx:
+                named_args["ltx_model"] = generic_model
+                set_arg_value("ltx_model", generic_model)
+            elif has_ltx and not has_generic:
                 named_args["video_model"] = ltx_model
                 set_arg_value("video_model", ltx_model)
 
@@ -592,6 +636,14 @@ def wrap_register_video_task(ui_input_ids: Optional[List[Optional[str]]] = None)
 
         for i, c in enumerate(checkpoint):
             t_id = task_id if i == 0 else f"{task_id}.{i}"
+            video_mode = "text_only"
+            if has_init and has_last:
+                video_mode = "init_last"
+            elif has_init:
+                video_mode = "init_only"
+            elif has_last:
+                video_mode = "last_only"
+
             task_runner.register_video_task(
                 t_id,
                 named_args,
@@ -600,7 +652,7 @@ def wrap_register_video_task(ui_input_ids: Optional[List[Optional[str]]] = None)
                 checkpoint=c,
                 task_name=task_name,
                 request=request,
-                video_mode="text_only",
+                video_mode=video_mode,
             )
 
         task_runner.execute_pending_tasks_threading()
@@ -1133,6 +1185,26 @@ def on_ui_settings():
     )
 
 
+def schedule_startup_queue(task_runner: TaskRunner):
+    start = time.monotonic()
+    delay = 0.5
+    timeout = 120
+
+    def try_start():
+        if task_runner is None or task_runner.dispose:
+            return
+        if modeldata.model_data.locked or shared.state.job == "Load model":
+            if time.monotonic() - start > timeout:
+                log.warning("[AgentScheduler] Startup wait timed out; starting queue runner")
+                task_runner.execute_pending_tasks_threading()
+                return
+            threading.Timer(delay, try_start).start()
+            return
+        task_runner.execute_pending_tasks_threading()
+
+    threading.Timer(delay, try_start).start()
+
+
 def on_app_started(block: gr.Blocks, app):
     global task_runner
     task_runner = get_instance(block)
@@ -1142,7 +1214,7 @@ def on_app_started(block: gr.Blocks, app):
     def finish_startup_bindings():
         bind_control_enqueue_button(block)
         bind_video_enqueue_button(block)
-        task_runner.execute_pending_tasks_threading()
+        schedule_startup_queue(task_runner)
 
     threading.Timer(0.1, finish_startup_bindings).start()
 

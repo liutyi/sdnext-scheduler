@@ -236,6 +236,8 @@ def regsiter_apis(app: App, task_runner: TaskRunner):
                 "video_mode": video_args.video_mode,
                 "video_engine": args_map.get("video_engine", None),
                 "video_model": args_map.get("video_model", None),
+                "has_init_image": bool(args_map.get("has_init_image", False)),
+                "has_last_image": bool(args_map.get("has_last_image", False)),
             }
         task_args = TaskRunner.instance.parse_task_args(task, deserialization=False)
         named_args = task_args.named_args
