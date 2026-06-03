@@ -72,6 +72,9 @@ class ControlTaskArgs(BaseModel):
     args_order: List[Optional[str]]
     args_values: List[Any]
     control_mode: str
+    input_source: Any = None
+    input_init: Any = None
+    input_mask: Any = None
     checkpoint: Optional[str] = None
 
 
@@ -299,6 +302,9 @@ class TaskRunner:
             args_order=args_order,
             args_values=args_values,
             control_mode=parsed.get("control_mode", "text_only"),
+            input_source=parsed.get("input_source", None),
+            input_init=parsed.get("input_init", None),
+            input_mask=parsed.get("input_mask", None),
             checkpoint=parsed.get("checkpoint", None),
         )
 
@@ -389,6 +395,9 @@ class TaskRunner:
         task_name: str = None,
         request: gr.Request = None,
         control_mode: str = "text_only",
+        input_source: Any = None,
+        input_init: Any = None,
+        input_mask: Any = None,
     ):
         progress.add_task_to_queue(task_id)
 
@@ -400,6 +409,9 @@ class TaskRunner:
                 "args_order": args_order,
                 "args_values": args_values,
                 "control_mode": control_mode,
+                "input_source": input_source,
+                "input_init": input_init,
+                "input_mask": input_mask,
                 "checkpoint": checkpoint,
                 "is_ui": True,
             }
@@ -735,21 +747,74 @@ class TaskRunner:
     def __execute_control_task(self, task_id: str, task_args: ControlTaskArgs):
         from modules.control.run import control_run
         from modules import ui_control_helpers as control_helpers
+        from modules import images
 
         if task_args.checkpoint is not None:
             current_checkpoint = getattr(shared.sd_model, "sd_checkpoint_info", None)
             current_title = getattr(current_checkpoint, "title", None)
             if current_title and task_args.checkpoint != current_title:
                 log.warning(
-                    "[AgentScheduler] Control task checkpoint override is not applied in text-only mode; "
+                    "[AgentScheduler] Control task checkpoint override is not applied; "
                     "using current model instead of requested checkpoint. "
                     f'requested="{task_args.checkpoint}" current="{current_title}"'
                 )
             # TODO: Apply control task checkpoint overrides once the control enqueue UI exposes selection in modernui.
 
-        control_helpers.input_source = None
-        control_helpers.input_init = None
-        control_helpers.input_mask = None
+        def deserialize_control_value(value):
+            if isinstance(value, list):
+                return [deserialize_control_value(v) for v in value]
+            if isinstance(value, dict) and not value.get("cls", None):
+                return {k: deserialize_control_value(v) for k, v in value.items()}
+            return deserialize_image(value)
+
+        input_source = deserialize_control_value(task_args.input_source)
+        input_init = deserialize_control_value(task_args.input_init)
+        input_mask = deserialize_control_value(task_args.input_mask)
+
+        width = task_args.named_args.get("control_before_resize_width")
+        height = task_args.named_args.get("control_before_resize_height")
+        resize_mode = task_args.named_args.get("control_before_resize_mode", 1)
+        resize_name = task_args.named_args.get("control_before_resize_name", "None")
+
+        def resize_control_value(value):
+            # Control updates generation size from input_image.size, so queued image
+            # payloads must be normalized to the captured UI size before replay.
+            if not isinstance(width, (int, float)) or not isinstance(height, (int, float)):
+                return value
+            target_width = int(width)
+            target_height = int(height)
+            if target_width <= 0 or target_height <= 0:
+                return value
+            if isinstance(value, list):
+                return [resize_control_value(v) for v in value]
+            if isinstance(value, dict):
+                return {k: resize_control_value(v) for k, v in value.items()}
+            if isinstance(value, Image.Image) and value.size != (target_width, target_height):
+                log.debug(
+                    "[AgentScheduler] control input resize: source=%sx%s target=%sx%s mode=%s name=%s",
+                    value.width,
+                    value.height,
+                    target_width,
+                    target_height,
+                    resize_mode,
+                    resize_name,
+                )
+                return images.resize_image(
+                    resize_mode=int(resize_mode or 1),
+                    im=value,
+                    width=target_width,
+                    height=target_height,
+                    upscaler_name=resize_name,
+                )
+            return value
+
+        input_source = resize_control_value(input_source)
+        input_init = resize_control_value(input_init)
+        input_mask = resize_control_value(input_mask)
+
+        control_helpers.input_source = input_source
+        control_helpers.input_init = input_init
+        control_helpers.input_mask = input_mask
 
         args = list(task_args.args_values)
         arg_key_counts = {}
@@ -760,8 +825,6 @@ class TaskRunner:
         for idx, key in enumerate(task_args.args_order):
             if key and arg_key_counts.get(key, 0) == 1 and key in task_args.named_args:
                 args[idx] = task_args.named_args[key]
-        if args:
-            args[0] = 0
         for key in ("control_sampling", "control_sampling_alt"):
             value = task_args.named_args.get(key)
             if isinstance(value, float):
@@ -778,9 +841,9 @@ class TaskRunner:
                 for res in control_run(
                     task_args.state,
                     [],
-                    None,
-                    None,
-                    None,
+                    input_source,
+                    input_init,
+                    input_mask,
                     task_args.active_tab,
                     True,
                     *args,
