@@ -37,6 +37,8 @@ task_runner: TaskRunner = None
 checkpoint_current = "Current Checkpoint"
 checkpoint_runtime = "Runtime Checkpoint"
 queue_with_every_checkpoints = "$$_queue_with_all_checkpoints_$$"
+queue_skip_task = "$$_queue_skip_$$"
+queue_error_prefix = "$$_queue_error_$$"
 
 ui_placement_as_tab = "As a tab"
 ui_placement_append_to_main = "Append to main UI"
@@ -77,11 +79,10 @@ control_checkpoint_dropdown = None
 control_submit_button = None
 video_generate_button = None
 video_generate_btn = None
+ltx_generate_btn = None
 video_enqueue_row = None
 video_checkpoint_dropdown = None
 video_submit_button = None
-ltx_steps_component = None
-ltx_model_component = None
 
 
 class Script(scripts.Script):
@@ -326,15 +327,13 @@ def after_component_control(component, **_kwargs):
 
 
 def after_component_video(component, **_kwargs):
-    global video_generate_button, video_generate_btn, ltx_steps_component, ltx_model_component
-
-    if component.elem_id == "ltx_model":
-        ltx_model_component = component
-    if component.elem_id == "ltx_steps":
-        ltx_steps_component = component
+    global video_generate_button, video_generate_btn, ltx_generate_btn
 
     if component.elem_id == "video_generate_btn":
         video_generate_btn = component
+        return
+    if component.elem_id == "ltx_generate_btn":
+        ltx_generate_btn = component
         return
 
     if component.elem_id != "video_generate":
@@ -414,19 +413,6 @@ def bind_video_enqueue_button(root: gr.Blocks):
     inputs = fn_block.inputs.copy()
     inputs.insert(0, video_checkpoint_dropdown)
 
-    def append_input(component):
-        if component is None:
-            return
-        elem_id = getattr(component, "elem_id", None)
-        if not elem_id:
-            return
-        if any(getattr(comp, "elem_id", None) == elem_id for comp in inputs):
-            return
-        inputs.append(component)
-
-    append_input(ltx_model_component)
-    append_input(ltx_steps_component)
-
     input_ids = [getattr(comp, "elem_id", None) for comp in inputs]
     if "video_engine" not in input_ids:
         log.debug("[AgentScheduler] video enqueue bind skipped (video_engine missing)")
@@ -441,6 +427,39 @@ def bind_video_enqueue_button(root: gr.Blocks):
             show_progress=False,
         )
 
+
+def bind_ltx_enqueue_button(root: gr.Blocks):
+    if ltx_generate_btn is None or video_submit_button is None:
+        log.debug("[AgentScheduler] LTX enqueue bind skipped (missing button)")
+        return
+
+    dependencies = [
+        x
+        for x in root.dependencies
+        if x["trigger"] == "click" and ltx_generate_btn._id in x["targets"]
+    ]
+    if len(dependencies) == 0:
+        log.debug("[AgentScheduler] LTX enqueue bind skipped (no dependencies)")
+        return
+
+    dependency = max(dependencies, key=lambda d: len(d["inputs"]))
+    fn_block = next(fn for fn in root.fns if compare_components_with_ids(fn.inputs, dependency["inputs"]))
+    inputs = fn_block.inputs.copy()
+    inputs.insert(0, video_checkpoint_dropdown)
+
+    input_ids = [getattr(comp, "elem_id", None) for comp in inputs]
+    if "ltx_model" not in input_ids:
+        log.debug("[AgentScheduler] LTX enqueue bind skipped (ltx_model missing)")
+        return
+
+    with root:
+        video_submit_button.click(
+            fn=wrap_register_ltx_task(ui_input_ids=input_ids[1:]),
+            _js="submit_enqueue_ltx",
+            inputs=inputs,
+            outputs=None,
+            show_progress=False,
+        )
 
 def wrap_register_control_task(
     input_start_idx: Optional[int] = None,
@@ -552,19 +571,32 @@ def wrap_register_video_task(ui_input_ids: Optional[List[Optional[str]]] = None)
 
         checkpoint: str = args[0]
         task_id = args[1]
+        if task_id == queue_skip_task:
+            return
+        if isinstance(task_id, str) and task_id.startswith(queue_error_prefix):
+            msg = task_id[len(queue_error_prefix):]
+            log.error(f"[AgentScheduler] video enqueue failed: {msg}")
+            raise gr.Error(msg)
+        ui_ids = ui_input_ids
 
-        if ui_input_ids is None:
+        if ui_ids is None:
             raise ValueError("Video enqueue input alignment failed: missing inputs")
-        if "video_engine" not in ui_input_ids:
+        if "video_engine" not in ui_ids:
             raise ValueError("Video enqueue input alignment failed: video_engine not found")
 
         args_values = list(args[1:])
-        args_order = ui_input_ids
+        args_order = ui_ids
         named_args = {
             elem_id: value
             for elem_id, value in zip(args_order, args_values)
             if elem_id
         }
+        engine = named_args.get("video_engine")
+        model = named_args.get("video_model")
+        if engine in (None, "", "None") or model in (None, "", "None"):
+            msg = "Select a video model before enqueueing a video task."
+            log.error(f"[AgentScheduler] video enqueue failed: {msg}")
+            raise gr.Error(msg)
         log.debug(
             "[AgentScheduler] video enqueue args: ids=%s values=%s",
             args_order,
@@ -622,29 +654,6 @@ def wrap_register_video_task(ui_input_ids: Optional[List[Optional[str]]] = None)
                 named_args["video_denoising_strength"] = 0.8
             set_arg_value("video_denoising_strength", named_args["video_denoising_strength"])
 
-        if named_args.get("video_engine") == "LTX Video":
-            generic_model = named_args.get("video_model")
-            ltx_model = named_args.get("ltx_model")
-            has_generic = generic_model not in (None, "", "None")
-            has_ltx = ltx_model not in (None, "", "None")
-            if not has_generic and not has_ltx:
-                raise ValueError("LTX model not selected. Set either the main model or the LTX model.")
-            if has_ltx and has_generic and generic_model != ltx_model:
-                log.warning(
-                    "[AgentScheduler] Both LTX and main video model are set; "
-                    "keeping main model selection and syncing LTX model."
-                )
-                named_args["ltx_model"] = generic_model
-                set_arg_value("ltx_model", generic_model)
-            elif has_ltx and not has_generic:
-                named_args["video_model"] = ltx_model
-                set_arg_value("video_model", ltx_model)
-
-            ltx_steps = named_args.get("ltx_steps")
-            if ltx_steps is not None:
-                named_args["video_steps"] = int(ltx_steps) if isinstance(ltx_steps, float) else ltx_steps
-                set_arg_value("video_steps", named_args["video_steps"])
-
         sampler_index = named_args.get("video_sampling")
         if isinstance(sampler_index, float):
             named_args["video_sampling"] = int(sampler_index)
@@ -688,6 +697,111 @@ def wrap_register_video_task(ui_input_ids: Optional[List[Optional[str]]] = None)
                 task_name=task_name,
                 request=request,
                 video_mode=video_mode,
+            )
+
+        task_runner.execute_pending_tasks_threading()
+
+    return f
+
+
+def wrap_register_ltx_task(ui_input_ids: Optional[List[Optional[str]]] = None):
+    def f(request: gr.Request, *args):
+        if len(args) < 2:
+            raise Exception("Invalid call")
+
+        checkpoint: str = args[0]
+        task_id = args[1]
+        if task_id == queue_skip_task:
+            return
+        if isinstance(task_id, str) and task_id.startswith(queue_error_prefix):
+            msg = task_id[len(queue_error_prefix):]
+            log.error(f"[AgentScheduler] LTX enqueue failed: {msg}")
+            raise gr.Error(msg)
+        ui_ids = ui_input_ids
+
+        if ui_ids is None:
+            raise ValueError("LTX enqueue input alignment failed: missing inputs")
+        if "ltx_model" not in ui_ids:
+            raise ValueError("LTX enqueue input alignment failed: ltx_model not found")
+
+        args_values = list(args[1:])
+        args_order = ui_ids
+        named_args = {
+            elem_id: value
+            for elem_id, value in zip(args_order, args_values)
+            if elem_id
+        }
+        model = named_args.get("ltx_model")
+        if model in (None, "", "None"):
+            msg = "Select an LTX model before enqueueing a video task."
+            log.error(f"[AgentScheduler] LTX enqueue failed: {msg}")
+            raise gr.Error(msg)
+
+        def set_arg_value(key: str, value):
+            if key in args_order:
+                idx = args_order.index(key)
+                if len(args_values) <= idx:
+                    args_values.extend([None] * (idx + 1 - len(args_values)))
+                args_values[idx] = value
+
+        def serialize_ltx_value(value):
+            if isinstance(value, list):
+                return [serialize_ltx_value(v) for v in value]
+            if isinstance(value, dict) and not value.get("cls", None):
+                return {k: serialize_ltx_value(v) for k, v in value.items()}
+            if hasattr(value, "name"):
+                return {"cls": "FilePath", "name": value.name}
+            return serialize_image(value)
+
+        for key in ("ltx_init_image", "ltx_last_image", "ltx_condition_batch"):
+            value = named_args.get(key)
+            value = serialize_ltx_value(value)
+            named_args[key] = value
+            set_arg_value(key, value)
+
+        condition_video = named_args.get("ltx_condition_video")
+        if condition_video:
+            log.warning(
+                "[AgentScheduler] LTX condition video is queued by filepath only and is not restart-safe; "
+                f'file="{condition_video}"'
+            )
+
+        sampler_index = named_args.get("ltx_sampling")
+        if isinstance(sampler_index, float):
+            named_args["ltx_sampling"] = int(sampler_index)
+            set_arg_value("ltx_sampling", int(sampler_index))
+
+        task_name = None
+        if task_id == queue_with_every_checkpoints:
+            task_id = str(uuid4())
+            checkpoint = list_checkpoint_tiles()
+        else:
+            if not task_id.startswith("task("):
+                task_name = task_id
+                task_id = str(uuid4())
+
+            if checkpoint is None or checkpoint == "" or checkpoint == checkpoint_current:
+                checkpoint = [shared.sd_model.sd_checkpoint_info.title]
+            elif checkpoint == checkpoint_runtime:
+                checkpoint = [None]
+            elif checkpoint.endswith(" checkpoints)"):
+                checkpoint_dir = " ".join(checkpoint.split(" ")[0:-2])
+                checkpoint = list(filter(lambda c: c.startswith(checkpoint_dir), list_checkpoint_tiles()))
+            else:
+                checkpoint = [checkpoint]
+
+        for i, c in enumerate(checkpoint):
+            t_id = task_id if i == 0 else f"{task_id}.{i}"
+            task_runner.register_video_task(
+                t_id,
+                named_args,
+                args_order,
+                args_values,
+                checkpoint=c,
+                task_name=task_name,
+                request=request,
+                video_mode="ltx",
+                task_type="video_ltx",
             )
 
         task_runner.execute_pending_tasks_threading()
@@ -1249,6 +1363,7 @@ def on_app_started(block: gr.Blocks, app):
     def finish_startup_bindings():
         bind_control_enqueue_button(block)
         bind_video_enqueue_button(block)
+        bind_ltx_enqueue_button(block)
         schedule_startup_queue(task_runner)
 
     threading.Timer(0.1, finish_startup_bindings).start()

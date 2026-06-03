@@ -8,6 +8,7 @@ import threading
 import gradio as gr
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from pydantic import BaseModel
 from typing import Any, Callable, Union, Optional, List, Dict
 from fastapi import FastAPI
@@ -441,6 +442,7 @@ class TaskRunner:
         task_name: str = None,
         request: gr.Request = None,
         video_mode: str = "text_only",
+        task_type: str = "video_text",
     ):
         progress.add_task_to_queue(task_id)
 
@@ -458,7 +460,7 @@ class TaskRunner:
         task = Task(
             id=task_id,
             name=task_name,
-            type="video_text",
+            type=task_type,
             params=params,
             script_params=b"",
         )
@@ -494,7 +496,7 @@ class TaskRunner:
                         "is_ui": True,
                         "task": task,
                     }
-                elif task.type == "video_text":
+                elif task.type in ("video_text", "video_ltx"):
                     task_args = self.parse_video_task_args(task)
                     task_meta = {
                         "is_img2img": False,
@@ -517,7 +519,7 @@ class TaskRunner:
                 samples_save = shared.opts.samples_save
                 shared.opts.samples_save = True
 
-                if task.type != "video_text":
+                if task.type not in ("video_text", "video_ltx"):
                     self.__wait_for_model_ready()
                 self.__prepare_task_model(task.type)
                 res = self.__execute_task(task_id, is_img2img, task_args, task_type=task.type)
@@ -568,7 +570,7 @@ class TaskRunner:
                                 "geninfo": None,
                                 "result_txt": res.get("result_txt") if isinstance(res, dict) else None,
                             }
-                        elif task.type == "video_text":
+                        elif task.type in ("video_text", "video_ltx"):
                             result = {
                                 "images": self.__saved_images_path.copy(),
                                 "geninfo": res.get("geninfo") if isinstance(res, dict) else None,
@@ -666,6 +668,8 @@ class TaskRunner:
             return self.__execute_control_task(task_id, task_args)
         if task_type == "video_text":
             return self.__execute_video_task(task_id, task_args)
+        if task_type == "video_ltx":
+            return self.__execute_ltx_task(task_id, task_args)
 
         if task_args.is_ui:
             ui_args = map_named_args_to_ui_task_args_list(task_args.named_args, task_args.script_args, is_img2img)
@@ -680,7 +684,7 @@ class TaskRunner:
             )
 
     def __prepare_task_model(self, task_type: Optional[str]):
-        if task_type == "video_text":
+        if task_type in ("video_text", "video_ltx"):
             self.__prepare_for_video_task()
         else:
             self.__prepare_for_image_task()
@@ -698,7 +702,7 @@ class TaskRunner:
         log.warning("[AgentScheduler] Model not ready after wait; continuing")
 
     def __prepare_for_video_task(self):
-        if self.__last_task_type == "video_text":
+        if self.__last_task_type in ("video_text", "video_ltx"):
             return
         try:
             from modules.video_models import video_load
@@ -708,7 +712,7 @@ class TaskRunner:
             video_load.loaded_model = None
 
     def __prepare_for_image_task(self):
-        if self.__last_task_type != "video_text":
+        if self.__last_task_type not in ("video_text", "video_ltx"):
             return
         try:
             from modules.video_models import video_load
@@ -879,8 +883,6 @@ class TaskRunner:
         filtered_order = []
         filtered_values = []
         for idx, key in enumerate(task_args.args_order):
-            if key in ("ltx_model", "ltx_steps"):
-                continue
             filtered_order.append(key)
             filtered_values.append(task_args.args_values[idx] if idx < len(task_args.args_values) else None)
 
@@ -919,7 +921,6 @@ class TaskRunner:
                 if key == "video_sampling":
                     args[idx] = sampler_index
 
-
         func = call_queue.wrap_gradio_gpu_call(
             video_run.generate,
             extra_outputs=[gr.update(), gr.update(), gr.update(), gr.update()],
@@ -948,6 +949,77 @@ class TaskRunner:
                     geninfo = None
 
         return {"video": video_path, "geninfo": geninfo}
+
+    def __execute_ltx_task(self, task_id: str, task_args: VideoTaskArgs):
+        from modules.ltx import ltx_process
+
+        if task_args.checkpoint is not None:
+            log.warning(
+                "[AgentScheduler] LTX task checkpoint override is not applied; "
+                f'requested="{task_args.checkpoint}"'
+            )
+
+        def deserialize_ltx_value(value):
+            if isinstance(value, list):
+                return [deserialize_ltx_value(v) for v in value]
+            if isinstance(value, dict) and value.get("cls") == "FilePath":
+                return SimpleNamespace(name=value.get("name"))
+            if isinstance(value, dict) and not value.get("cls", None):
+                return {k: deserialize_ltx_value(v) for k, v in value.items()}
+            return deserialize_image(value)
+
+        def validate_file_path(path: str, label: str):
+            if not path:
+                return None
+            if not os.path.isfile(path):
+                return FileNotFoundError(f"LTX {label} file no longer exists: {path}")
+            return None
+
+        args = [deserialize_ltx_value(v) for v in task_args.args_values]
+        for idx, key in enumerate(task_args.args_order):
+            if key and key in task_args.named_args:
+                args[idx] = deserialize_ltx_value(task_args.named_args[key])
+
+        condition_video = task_args.named_args.get("ltx_condition_video")
+        missing = validate_file_path(condition_video, "condition video")
+        if missing is not None:
+            return missing
+
+        condition_files = task_args.named_args.get("ltx_condition_batch")
+        if isinstance(condition_files, list):
+            for item in condition_files:
+                if isinstance(item, dict) and item.get("cls") == "FilePath":
+                    missing = validate_file_path(item.get("name"), "condition batch")
+                    if missing is not None:
+                        return missing
+
+        sampler_index = task_args.named_args.get("ltx_sampling")
+        if isinstance(sampler_index, float):
+            for idx, key in enumerate(task_args.args_order):
+                if key == "ltx_sampling":
+                    args[idx] = int(sampler_index)
+
+        res = None
+        try:
+            for res in ltx_process.run_ltx(*args):
+                pass
+        except Exception as e:
+            if "CUDA out of memory" in str(e):
+                return OutOfMemoryError()
+            return e
+
+        if isinstance(res, Exception):
+            return res
+
+        video_path = None
+        result_txt = None
+        if isinstance(res, (list, tuple)) and len(res) >= 2:
+            video_path = res[0]
+            result_txt = res[1]
+        if not video_path:
+            return RuntimeError(result_txt or "LTX generation failed")
+
+        return {"video": video_path, "geninfo": None, "result_txt": result_txt}
 
     def __restore_control_ui_state(self):
         if self.__control_ui_state is None:
