@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 import gradio as gr
 from PIL import Image
 from uuid import uuid4
@@ -1135,11 +1136,15 @@ def on_ui_settings():
 def on_app_started(block: gr.Blocks, app):
     global task_runner
     task_runner = get_instance(block)
-    task_runner.execute_pending_tasks_threading()
     regsiter_apis(app, task_runner)
     task_runner.on_task_cleared(lambda: remove_old_tasks())
-    bind_control_enqueue_button(block)
-    bind_video_enqueue_button(block)
+
+    def finish_startup_bindings():
+        bind_control_enqueue_button(block)
+        bind_video_enqueue_button(block)
+        task_runner.execute_pending_tasks_threading()
+
+    threading.Timer(0.1, finish_startup_bindings).start()
 
     if getattr(shared.opts, "queue_ui_placement", "") == ui_placement_append_to_main and block:
         with block:
