@@ -129,6 +129,21 @@ class TaskRunner:
     def paused(self) -> bool:
         return getattr(shared.opts, "queue_paused", False)
 
+    def __pending_task_count(self) -> int:
+        return task_manager.count_tasks(status="pending")
+
+    def __log_task_queued(self, task: Task):
+        if self.paused:
+            queue_state = "paused"
+        elif self.is_executing_task:
+            queue_state = "executing"
+        else:
+            queue_state = "ready"
+        log.info(
+            f"[AgentScheduler] Queued {task.type} task {task.id}; "
+            f"queue is {queue_state}; pending tasks: {self.__pending_task_count()}"
+        )
+
     def __serialize_ui_task_args(
         self,
         is_img2img: bool,
@@ -353,6 +368,7 @@ class TaskRunner:
 
         self.__run_callbacks("task_registered", task_id, is_img2img=is_img2img, is_ui=True, args=params)
         self.__total_pending_tasks += 1
+        self.__log_task_queued(task)
 
         return task
 
@@ -381,6 +397,7 @@ class TaskRunner:
 
         self.__run_callbacks("task_registered", task_id, is_img2img=is_img2img, is_ui=False, args=params)
         self.__total_pending_tasks += 1
+        self.__log_task_queued(task)
 
         return task
 
@@ -429,6 +446,7 @@ class TaskRunner:
 
         self.__run_callbacks("task_registered", task_id, is_img2img=False, is_ui=True, args=params)
         self.__total_pending_tasks += 1
+        self.__log_task_queued(task)
 
         return task
 
@@ -468,6 +486,7 @@ class TaskRunner:
 
         self.__run_callbacks("task_registered", task_id, is_img2img=False, is_ui=True, args=params)
         self.__total_pending_tasks += 1
+        self.__log_task_queued(task)
 
         return task
 
@@ -637,15 +656,16 @@ class TaskRunner:
 
     def execute_pending_tasks_threading(self):
         if self.paused:
-            log.info("[AgentScheduler] Runner is paused")
+            log.info(f"[AgentScheduler] Queue is paused; pending tasks: {self.__pending_task_count()}")
             return
 
         if self.is_executing_task:
-            log.info("[AgentScheduler] Runner already started")
+            log.info(f"[AgentScheduler] Queue runner already active; pending tasks: {self.__pending_task_count()}")
             return
 
         pending_task = self.__get_pending_task()
         if pending_task:
+            log.info(f"[AgentScheduler] Starting queue runner; pending tasks: {self.__total_pending_tasks}")
             # Start the infinite loop in a separate thread
             self.__current_thread = threading.Thread(
                 target=self.execute_task,
@@ -1059,7 +1079,7 @@ class TaskRunner:
             return None
 
         if self.paused:
-            log.info("[AgentScheduler] Runner is paused")
+            log.info(f"[AgentScheduler] Queue is paused; pending tasks: {self.__pending_task_count()}")
             return None
 
         # # delete task that are too old

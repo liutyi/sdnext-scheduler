@@ -328,6 +328,21 @@ async function notify(response: ResponseStatus) {
 window.notify = notify;
 window.origRandomId = window.randomId;
 
+async function notifyEnqueueResult() {
+  await pendingStore.refresh();
+  const state = pendingStore.getState();
+  const pending = state.total_pending_tasks;
+  const pendingMessage = pending > 0 ? ` Pending jobs: ${pending}.` : '';
+  const stateMessage = state.paused ? 'Queue is PAUSED.' : 'Queue is executing.';
+  await notify({ success: true, message: `Task queued. ${stateMessage}${pendingMessage}` });
+}
+
+function refreshQueueAfterEnqueue() {
+  setTimeout(() => {
+    void notifyEnqueueResult();
+  }, 1000);
+}
+
 function showTaskProgress(task_id: string, type: string | undefined, callback: () => void) {
   // delay progress request until the options loaded
   if (Object.keys(opts).length === 0) {
@@ -395,6 +410,8 @@ function initQueueHandler() {
   };
   const queueSkipTask = '$$_queue_skip_$$';
   const queueErrorPrefix = '$$_queue_error_$$';
+  const isQueuedTaskId = (taskId: unknown) =>
+    typeof taskId === 'string' && taskId !== queueSkipTask && !taskId.startsWith(queueErrorPrefix);
   const isElementVisible = (elemId: string) => {
     const el = gradioApp().querySelector<HTMLElement>(`#${elemId}`);
     return el != null && el.getClientRects().length > 0;
@@ -542,11 +559,7 @@ function initQueueHandler() {
       btnEnqueue.innerText = 'Queued';
       setTimeout(() => {
         btnEnqueue.innerText = 'Enqueue';
-        if (!sharedStore.getState().uiAsTab) {
-          if (sharedStore.getState().selectedTab === 'pending') {
-            pendingStore.refresh();
-          }
-        }
+        void notifyEnqueueResult();
       }, 1000);
     }
 
@@ -568,11 +581,7 @@ function initQueueHandler() {
       btnImg2ImgEnqueue.innerText = 'Queued';
       setTimeout(() => {
         btnImg2ImgEnqueue.innerText = 'Enqueue';
-        if (!sharedStore.getState().uiAsTab) {
-          if (sharedStore.getState().selectedTab === 'pending') {
-            pendingStore.refresh();
-          }
-        }
+        void notifyEnqueueResult();
       }, 1000);
     }
 
@@ -600,13 +609,7 @@ function initQueueHandler() {
     window.randomId = window.origRandomId;
 
     if (btnControlEnqueue != null) {
-      setTimeout(() => {
-        if (!sharedStore.getState().uiAsTab) {
-          if (sharedStore.getState().selectedTab === 'pending') {
-            pendingStore.refresh();
-          }
-        }
-      }, 1000);
+      refreshQueueAfterEnqueue();
     }
 
     return res;
@@ -625,14 +628,8 @@ function initQueueHandler() {
       : handleVideoTargetError(target, 'video');
     window.randomId = window.origRandomId;
 
-    if (btnVideoEnqueue != null && res[1] !== queueSkipTask) {
-      setTimeout(() => {
-        if (!sharedStore.getState().uiAsTab) {
-          if (sharedStore.getState().selectedTab === 'pending') {
-            pendingStore.refresh();
-          }
-        }
-      }, 1000);
+    if (btnVideoEnqueue != null && isQueuedTaskId(res[1])) {
+      refreshQueueAfterEnqueue();
     }
 
     return res;
@@ -649,14 +646,8 @@ function initQueueHandler() {
       : handleVideoTargetError(target, 'ltx');
     window.randomId = window.origRandomId;
 
-    if (btnVideoEnqueue != null && res[1] !== queueSkipTask) {
-      setTimeout(() => {
-        if (!sharedStore.getState().uiAsTab) {
-          if (sharedStore.getState().selectedTab === 'pending') {
-            pendingStore.refresh();
-          }
-        }
-      }, 1000);
+    if (btnVideoEnqueue != null && isQueuedTaskId(res[1])) {
+      refreshQueueAfterEnqueue();
     }
 
     return res;
