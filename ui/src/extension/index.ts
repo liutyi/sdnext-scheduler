@@ -60,6 +60,7 @@ declare global {
   function submit_enqueue_img2img(...args: any[]): any[];
   function submit_enqueue_control(...args: any[]): any[];
   function submit_enqueue_video(...args: any[]): any[];
+  function controlInputMode(inputMode: string, ...args: any[]): any[];
   function agent_scheduler_status_filter_changed(value: string): void;
   function appendContextMenuOption(selector: string, label: string, callback: () => void): void;
   function modalSaveImage(event: Event): void;
@@ -430,8 +431,10 @@ function initQueueHandler() {
   const btnEnqueue = gradioApp().querySelector<HTMLButtonElement>('#txt2img_enqueue')!;
   window.submit_enqueue = (...args) => {
     const res = create_submit_args(args);
+    const state = res[1];
     res[0] = getUiCheckpoint('txt2img');
     res[1] = randomId();
+    res.splice(2, 0, state);
     window.randomId = window.origRandomId;
 
     if (btnEnqueue != null) {
@@ -452,9 +455,12 @@ function initQueueHandler() {
   const btnImg2ImgEnqueue = gradioApp().querySelector<HTMLButtonElement>('#img2img_enqueue')!;
   window.submit_enqueue_img2img = (...args) => {
     const res = create_submit_args(args);
+    const state = res[1];
+    const mode = get_tab_index('mode_img2img');
     res[0] = getUiCheckpoint('img2img');
     res[1] = randomId();
-    res[2] = get_tab_index('mode_img2img');
+    res.splice(2, 0, state);
+    res[3] = mode;
     window.randomId = window.origRandomId;
 
     if (btnImg2ImgEnqueue != null) {
@@ -477,6 +483,19 @@ function initQueueHandler() {
     const res = create_submit_args(args);
     res[0] = getUiCheckpoint('control');
     res[1] = randomId();
+    const inputIds = getDependencyInputsForTarget('control_enqueue');
+    const inputTypeId = getComponentIdByElemId('control_input_type');
+    if (inputIds != null && inputTypeId != null) {
+      const occurrences = inputIds
+        .map((id, index) => (id === inputTypeId ? index : -1))
+        .filter(index => index >= 0);
+      const selectStart = occurrences.length > 1 ? occurrences[1] - 1 : -1;
+      if (selectStart >= 0 && selectStart < res.length) {
+        const [inputMode, ...inputArgs] = res.slice(selectStart);
+        const selectArgs = window.controlInputMode(inputMode, ...inputArgs);
+        res.splice(selectStart, selectArgs.length, ...selectArgs);
+      }
+    }
     window.randomId = window.origRandomId;
 
     if (btnControlEnqueue != null) {
