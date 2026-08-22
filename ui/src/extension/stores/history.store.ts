@@ -26,7 +26,7 @@ export const createHistoryTasksStore = (initialState: HistoryTasksState) => {
 
   const actions: HistoryTasksActions = {
     refresh: async options => {
-      const { limit = 1000, offset = 0 } = options ?? {};
+      const { limit = 2000, offset = 0 } = options ?? {};
       const status = getState().status ?? '';
 
       return fetch(`/agent-scheduler/v1/history?status=${status}&limit=${limit}&offset=${offset}`)
