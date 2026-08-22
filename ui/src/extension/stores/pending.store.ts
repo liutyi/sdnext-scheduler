@@ -2,6 +2,8 @@ import { createStore } from 'zustand/vanilla';
 
 import { ResponseStatus, Task } from '../types';
 
+import { HistoryTasksStore } from './history.store';
+
 type PendingTasksState = {
   current_task_id: string | null;
   total_pending_tasks: number;
@@ -24,7 +26,10 @@ type PendingTasksActions = {
 
 export type PendingTasksStore = ReturnType<typeof createPendingTasksStore>;
 
-export const createPendingTasksStore = (initialState: PendingTasksState) => {
+export const createPendingTasksStore = (
+  initialState: PendingTasksState,
+  historyStore?: HistoryTasksStore
+) => {
   const store = createStore<PendingTasksState>()(() => initialState);
   const { getState, setState, subscribe } = store;
 
@@ -70,7 +75,7 @@ export const createPendingTasksStore = (initialState: PendingTasksState) => {
         .then(data => {
           setTimeout(() => {
             actions.refresh();
-            historyStore.refresh();
+            historyStore?.refresh();
           }, 500);
           return data;
         });

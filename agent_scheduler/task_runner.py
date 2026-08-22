@@ -8,6 +8,7 @@ import threading
 import gradio as gr
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from pydantic import BaseModel
 from typing import Any, Callable, Union, Optional, List, Dict
 from fastapi import FastAPI
@@ -37,6 +38,7 @@ from .task_helpers import (
     encode_image_to_base64,
     serialize_img2img_image_args,
     deserialize_img2img_image_args,
+    deserialize_image,
     serialize_script_args,
     deserialize_script_args,
     serialize_api_task_args,
@@ -71,6 +73,9 @@ class ControlTaskArgs(BaseModel):
     args_order: List[Optional[str]]
     args_values: List[Any]
     control_mode: str
+    input_source: Any = None
+    input_init: Any = None
+    input_mask: Any = None
     checkpoint: Optional[str] = None
 
 
@@ -95,6 +100,7 @@ class TaskRunner:
         self.__saved_images_path: List[str] = []
         script_callbacks.on_image_saved(self.__on_image_saved)
         self.__control_ui_state = None
+        self.__last_task_type = None
 
         self.script_callbacks = {
             "task_registered": [],
@@ -122,6 +128,21 @@ class TaskRunner:
     @property
     def paused(self) -> bool:
         return getattr(shared.opts, "queue_paused", False)
+
+    def __pending_task_count(self) -> int:
+        return task_manager.count_tasks(status="pending")
+
+    def __log_task_queued(self, task: Task):
+        if self.paused:
+            queue_state = "paused"
+        elif self.is_executing_task:
+            queue_state = "executing"
+        else:
+            queue_state = "ready"
+        log.info(
+            f"[AgentScheduler] Queued {task.type} task {task.id}; "
+            f"queue is {queue_state}; pending tasks: {self.__pending_task_count()}"
+        )
 
     def __serialize_ui_task_args(
         self,
@@ -297,6 +318,9 @@ class TaskRunner:
             args_order=args_order,
             args_values=args_values,
             control_mode=parsed.get("control_mode", "text_only"),
+            input_source=parsed.get("input_source", None),
+            input_init=parsed.get("input_init", None),
+            input_mask=parsed.get("input_mask", None),
             checkpoint=parsed.get("checkpoint", None),
         )
 
@@ -344,6 +368,7 @@ class TaskRunner:
 
         self.__run_callbacks("task_registered", task_id, is_img2img=is_img2img, is_ui=True, args=params)
         self.__total_pending_tasks += 1
+        self.__log_task_queued(task)
 
         return task
 
@@ -372,6 +397,7 @@ class TaskRunner:
 
         self.__run_callbacks("task_registered", task_id, is_img2img=is_img2img, is_ui=False, args=params)
         self.__total_pending_tasks += 1
+        self.__log_task_queued(task)
 
         return task
 
@@ -387,6 +413,9 @@ class TaskRunner:
         task_name: str = None,
         request: gr.Request = None,
         control_mode: str = "text_only",
+        input_source: Any = None,
+        input_init: Any = None,
+        input_mask: Any = None,
     ):
         progress.add_task_to_queue(task_id)
 
@@ -398,6 +427,9 @@ class TaskRunner:
                 "args_order": args_order,
                 "args_values": args_values,
                 "control_mode": control_mode,
+                "input_source": input_source,
+                "input_init": input_init,
+                "input_mask": input_mask,
                 "checkpoint": checkpoint,
                 "is_ui": True,
             }
@@ -414,6 +446,7 @@ class TaskRunner:
 
         self.__run_callbacks("task_registered", task_id, is_img2img=False, is_ui=True, args=params)
         self.__total_pending_tasks += 1
+        self.__log_task_queued(task)
 
         return task
 
@@ -427,6 +460,7 @@ class TaskRunner:
         task_name: str = None,
         request: gr.Request = None,
         video_mode: str = "text_only",
+        task_type: str = "video_text",
     ):
         progress.add_task_to_queue(task_id)
 
@@ -444,7 +478,7 @@ class TaskRunner:
         task = Task(
             id=task_id,
             name=task_name,
-            type="video_text",
+            type=task_type,
             params=params,
             script_params=b"",
         )
@@ -452,6 +486,7 @@ class TaskRunner:
 
         self.__run_callbacks("task_registered", task_id, is_img2img=False, is_ui=True, args=params)
         self.__total_pending_tasks += 1
+        self.__log_task_queued(task)
 
         return task
 
@@ -480,7 +515,7 @@ class TaskRunner:
                         "is_ui": True,
                         "task": task,
                     }
-                elif task.type == "video_text":
+                elif task.type in ("video_text", "video_ltx"):
                     task_args = self.parse_video_task_args(task)
                     task_meta = {
                         "is_img2img": False,
@@ -503,7 +538,11 @@ class TaskRunner:
                 samples_save = shared.opts.samples_save
                 shared.opts.samples_save = True
 
+                if task.type not in ("video_text", "video_ltx"):
+                    self.__wait_for_model_ready()
+                self.__prepare_task_model(task.type)
                 res = self.__execute_task(task_id, is_img2img, task_args, task_type=task.type)
+                self.__last_task_type = task.type
 
                 # disable image saving
                 shared.opts.samples_save = samples_save
@@ -529,12 +568,14 @@ class TaskRunner:
                             TaskStatus.FAILED,
                             result=str(res) if res else None,
                         )
+                        log.info(f"[AgentScheduler] Task {task_id} finished: status=failed")
                         self.__run_callbacks("task_finished", task_id, status=TaskStatus.FAILED, **task_meta)
                 else:
                     is_interrupted = self.interrupted == task_id
                     if is_interrupted:
                         log.info(f"\n[AgentScheduler] Task {task.id} interrupted")
                         self.__update_task_state(task, TaskStatus.INTERRUPTED)
+                        log.info(f"[AgentScheduler] Task {task_id} finished: status=interrupted")
                         self.__run_callbacks(
                             "task_finished",
                             task_id,
@@ -548,7 +589,7 @@ class TaskRunner:
                                 "geninfo": None,
                                 "result_txt": res.get("result_txt") if isinstance(res, dict) else None,
                             }
-                        elif task.type == "video_text":
+                        elif task.type in ("video_text", "video_ltx"):
                             result = {
                                 "images": self.__saved_images_path.copy(),
                                 "geninfo": res.get("geninfo") if isinstance(res, dict) else None,
@@ -566,6 +607,7 @@ class TaskRunner:
                             TaskStatus.DONE,
                             result=json.dumps(result),
                         )
+                        log.info(f"[AgentScheduler] Task {task_id} finished: status=done")
                         self.__run_callbacks(
                             "task_finished",
                             task_id,
@@ -614,15 +656,16 @@ class TaskRunner:
 
     def execute_pending_tasks_threading(self):
         if self.paused:
-            log.info("[AgentScheduler] Runner is paused")
+            log.info(f"[AgentScheduler] Queue is paused; pending tasks: {self.__pending_task_count()}")
             return
 
         if self.is_executing_task:
-            log.info("[AgentScheduler] Runner already started")
+            log.info(f"[AgentScheduler] Queue runner already active; pending tasks: {self.__pending_task_count()}")
             return
 
         pending_task = self.__get_pending_task()
         if pending_task:
+            log.info(f"[AgentScheduler] Starting queue runner; pending tasks: {self.__total_pending_tasks}")
             # Start the infinite loop in a separate thread
             self.__current_thread = threading.Thread(
                 target=self.execute_task,
@@ -645,6 +688,8 @@ class TaskRunner:
             return self.__execute_control_task(task_id, task_args)
         if task_type == "video_text":
             return self.__execute_video_task(task_id, task_args)
+        if task_type == "video_ltx":
+            return self.__execute_ltx_task(task_id, task_args)
 
         if task_args.is_ui:
             ui_args = map_named_args_to_ui_task_args_list(task_args.named_args, task_args.script_args, is_img2img)
@@ -657,6 +702,46 @@ class TaskRunner:
                 script_args=task_args.script_args,
                 **task_args.named_args,
             )
+
+    def __prepare_task_model(self, task_type: Optional[str]):
+        if task_type in ("video_text", "video_ltx"):
+            self.__prepare_for_video_task()
+        else:
+            self.__prepare_for_image_task()
+
+    def __wait_for_model_ready(self, timeout: float = 120.0):
+        if shared.sd_model is not None and shared.sd_loaded and getattr(shared.sd_model, "sd_checkpoint_info", None) is not None:
+            return
+
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if shared.sd_model is not None and shared.sd_loaded and getattr(shared.sd_model, "sd_checkpoint_info", None) is not None:
+                return
+            time.sleep(0.5)
+
+        log.warning("[AgentScheduler] Model not ready after wait; continuing")
+
+    def __prepare_for_video_task(self):
+        if self.__last_task_type in ("video_text", "video_ltx"):
+            return
+        try:
+            from modules.video_models import video_load
+        except Exception:
+            return
+        if video_load.loaded_model is not None:
+            video_load.loaded_model = None
+
+    def __prepare_for_image_task(self):
+        if self.__last_task_type not in ("video_text", "video_ltx"):
+            return
+        try:
+            from modules.video_models import video_load
+        except Exception:
+            video_load = None
+        if video_load is not None and video_load.loaded_model is not None:
+            video_load.loaded_model = None
+        from modules import sd_models
+        sd_models.reload_model_weights()
 
     def __execute_ui_task(self, task_id: str, is_img2img: bool, *args):
         func = wrap_gradio_call(img2img if is_img2img else txt2img, add_stats=True)
@@ -686,21 +771,74 @@ class TaskRunner:
     def __execute_control_task(self, task_id: str, task_args: ControlTaskArgs):
         from modules.control.run import control_run
         from modules import ui_control_helpers as control_helpers
+        from modules import images
 
         if task_args.checkpoint is not None:
             current_checkpoint = getattr(shared.sd_model, "sd_checkpoint_info", None)
             current_title = getattr(current_checkpoint, "title", None)
             if current_title and task_args.checkpoint != current_title:
                 log.warning(
-                    "[AgentScheduler] Control task checkpoint override is not applied in text-only mode; "
+                    "[AgentScheduler] Control task checkpoint override is not applied; "
                     "using current model instead of requested checkpoint. "
                     f'requested="{task_args.checkpoint}" current="{current_title}"'
                 )
             # TODO: Apply control task checkpoint overrides once the control enqueue UI exposes selection in modernui.
 
-        control_helpers.input_source = None
-        control_helpers.input_init = None
-        control_helpers.input_mask = None
+        def deserialize_control_value(value):
+            if isinstance(value, list):
+                return [deserialize_control_value(v) for v in value]
+            if isinstance(value, dict) and not value.get("cls", None):
+                return {k: deserialize_control_value(v) for k, v in value.items()}
+            return deserialize_image(value)
+
+        input_source = deserialize_control_value(task_args.input_source)
+        input_init = deserialize_control_value(task_args.input_init)
+        input_mask = deserialize_control_value(task_args.input_mask)
+
+        width = task_args.named_args.get("control_before_resize_width")
+        height = task_args.named_args.get("control_before_resize_height")
+        resize_mode = task_args.named_args.get("control_before_resize_mode", 1)
+        resize_name = task_args.named_args.get("control_before_resize_name", "None")
+
+        def resize_control_value(value):
+            # Control updates generation size from input_image.size, so queued image
+            # payloads must be normalized to the captured UI size before replay.
+            if not isinstance(width, (int, float)) or not isinstance(height, (int, float)):
+                return value
+            target_width = int(width)
+            target_height = int(height)
+            if target_width <= 0 or target_height <= 0:
+                return value
+            if isinstance(value, list):
+                return [resize_control_value(v) for v in value]
+            if isinstance(value, dict):
+                return {k: resize_control_value(v) for k, v in value.items()}
+            if isinstance(value, Image.Image) and value.size != (target_width, target_height):
+                log.debug(
+                    "[AgentScheduler] control input resize: source=%sx%s target=%sx%s mode=%s name=%s",
+                    value.width,
+                    value.height,
+                    target_width,
+                    target_height,
+                    resize_mode,
+                    resize_name,
+                )
+                return images.resize_image(
+                    resize_mode=int(resize_mode or 1),
+                    im=value,
+                    width=target_width,
+                    height=target_height,
+                    upscaler_name=resize_name,
+                )
+            return value
+
+        input_source = resize_control_value(input_source)
+        input_init = resize_control_value(input_init)
+        input_mask = resize_control_value(input_mask)
+
+        control_helpers.input_source = input_source
+        control_helpers.input_init = input_init
+        control_helpers.input_mask = input_mask
 
         args = list(task_args.args_values)
         arg_key_counts = {}
@@ -711,8 +849,6 @@ class TaskRunner:
         for idx, key in enumerate(task_args.args_order):
             if key and arg_key_counts.get(key, 0) == 1 and key in task_args.named_args:
                 args[idx] = task_args.named_args[key]
-        if args:
-            args[0] = 0
         for key in ("control_sampling", "control_sampling_alt"):
             value = task_args.named_args.get(key)
             if isinstance(value, float):
@@ -729,9 +865,9 @@ class TaskRunner:
                 for res in control_run(
                     task_args.state,
                     [],
-                    None,
-                    None,
-                    None,
+                    input_source,
+                    input_init,
+                    input_mask,
                     task_args.active_tab,
                     True,
                     *args,
@@ -767,15 +903,36 @@ class TaskRunner:
         filtered_order = []
         filtered_values = []
         for idx, key in enumerate(task_args.args_order):
-            if key in ("ltx_model", "ltx_steps"):
-                continue
             filtered_order.append(key)
             filtered_values.append(task_args.args_values[idx] if idx < len(task_args.args_values) else None)
+
+        log.debug(
+            "[AgentScheduler] video task args: order=%s values=%s has_init=%s has_last=%s mode=%s",
+            filtered_order,
+            len(filtered_values),
+            task_args.named_args.get("has_init_image"),
+            task_args.named_args.get("has_last_image"),
+            task_args.video_mode,
+        )
+
+        for idx, key in enumerate(filtered_order):
+            if key not in ("video_image", "video_last"):
+                continue
+            payload = filtered_values[idx]
+            if payload is not None:
+                log.debug("[AgentScheduler] video task deserialize %s type=%s", key, type(payload).__name__)
+                filtered_values[idx] = deserialize_image(payload)
 
         args = list(filtered_values)
         for idx, key in enumerate(filtered_order):
             if key and key in task_args.named_args:
                 args[idx] = task_args.named_args[key]
+
+        if task_args.named_args.get("has_init_image") or task_args.named_args.get("has_last_image"):
+            if "video_denoising_strength" not in task_args.named_args:
+                for idx, key in enumerate(filtered_order):
+                    if key == "video_denoising_strength" and args[idx] is None:
+                        args[idx] = 0.8
 
         sampler_index = task_args.named_args.get("video_sampling")
         if isinstance(sampler_index, float):
@@ -783,7 +940,6 @@ class TaskRunner:
             for idx, key in enumerate(filtered_order):
                 if key == "video_sampling":
                     args[idx] = sampler_index
-
 
         func = call_queue.wrap_gradio_gpu_call(
             video_run.generate,
@@ -813,6 +969,77 @@ class TaskRunner:
                     geninfo = None
 
         return {"video": video_path, "geninfo": geninfo}
+
+    def __execute_ltx_task(self, task_id: str, task_args: VideoTaskArgs):
+        from modules.ltx import ltx_process
+
+        if task_args.checkpoint is not None:
+            log.warning(
+                "[AgentScheduler] LTX task checkpoint override is not applied; "
+                f'requested="{task_args.checkpoint}"'
+            )
+
+        def deserialize_ltx_value(value):
+            if isinstance(value, list):
+                return [deserialize_ltx_value(v) for v in value]
+            if isinstance(value, dict) and value.get("cls") == "FilePath":
+                return SimpleNamespace(name=value.get("name"))
+            if isinstance(value, dict) and not value.get("cls", None):
+                return {k: deserialize_ltx_value(v) for k, v in value.items()}
+            return deserialize_image(value)
+
+        def validate_file_path(path: str, label: str):
+            if not path:
+                return None
+            if not os.path.isfile(path):
+                return FileNotFoundError(f"LTX {label} file no longer exists: {path}")
+            return None
+
+        args = [deserialize_ltx_value(v) for v in task_args.args_values]
+        for idx, key in enumerate(task_args.args_order):
+            if key and key in task_args.named_args:
+                args[idx] = deserialize_ltx_value(task_args.named_args[key])
+
+        condition_video = task_args.named_args.get("ltx_condition_video")
+        missing = validate_file_path(condition_video, "condition video")
+        if missing is not None:
+            return missing
+
+        condition_files = task_args.named_args.get("ltx_condition_batch")
+        if isinstance(condition_files, list):
+            for item in condition_files:
+                if isinstance(item, dict) and item.get("cls") == "FilePath":
+                    missing = validate_file_path(item.get("name"), "condition batch")
+                    if missing is not None:
+                        return missing
+
+        sampler_index = task_args.named_args.get("ltx_sampling")
+        if isinstance(sampler_index, float):
+            for idx, key in enumerate(task_args.args_order):
+                if key == "ltx_sampling":
+                    args[idx] = int(sampler_index)
+
+        res = None
+        try:
+            for res in ltx_process.run_ltx(*args):
+                pass
+        except Exception as e:
+            if "CUDA out of memory" in str(e):
+                return OutOfMemoryError()
+            return e
+
+        if isinstance(res, Exception):
+            return res
+
+        video_path = None
+        result_txt = None
+        if isinstance(res, (list, tuple)) and len(res) >= 2:
+            video_path = res[0]
+            result_txt = res[1]
+        if not video_path:
+            return RuntimeError(result_txt or "LTX generation failed")
+
+        return {"video": video_path, "geninfo": None, "result_txt": result_txt}
 
     def __restore_control_ui_state(self):
         if self.__control_ui_state is None:
@@ -852,7 +1079,7 @@ class TaskRunner:
             return None
 
         if self.paused:
-            log.info("[AgentScheduler] Runner is paused")
+            log.info(f"[AgentScheduler] Queue is paused; pending tasks: {self.__pending_task_count()}")
             return None
 
         # # delete task that are too old
