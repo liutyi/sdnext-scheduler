@@ -30,7 +30,7 @@ export const createPendingTasksStore = (initialState: PendingTasksState) => {
 
   const actions: PendingTasksActions = {
     refresh: async () => {
-      return fetch('/agent-scheduler/v1/queue?limit=2000')
+      return fetch('/agent-scheduler/v1/queue?limit=1000')
         .then(response => response.json())
         .then(setState);
     },
