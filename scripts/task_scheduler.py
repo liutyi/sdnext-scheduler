@@ -2,6 +2,8 @@ import os
 import json
 import threading
 import time
+from html import escape
+from urllib.parse import quote
 import gradio as gr
 from PIL import Image
 from uuid import uuid4
@@ -27,7 +29,7 @@ from agent_scheduler.task_runner import TaskRunner, get_instance
 from agent_scheduler.helpers import log, compare_components_with_ids, get_components_by_ids, is_macos
 from agent_scheduler.db import init as init_db, task_manager, TaskStatus
 from agent_scheduler.api import regsiter_apis
-from agent_scheduler.task_helpers import serialize_image
+from agent_scheduler.task_helpers import create_input_size, create_input_thumbnail, serialize_image
 
 is_sdnext = parser.description == "SD.Next"
 ToolButton = gr.Button if is_sdnext else ui_components.ToolButton
@@ -500,6 +502,9 @@ def wrap_register_control_task(
         input_source = serialize_control_value(control_helpers.input_source)
         input_init = serialize_control_value(control_helpers.input_init)
         input_mask = serialize_control_value(control_helpers.input_mask)
+        input_thumbnail = create_input_thumbnail([input_source, input_init, input_mask])
+        input_size = create_input_size([input_source, input_init, input_mask])
+        input_width, input_height = input_size if input_size is not None else (None, None)
         control_mode = "image" if input_source is not None or input_init is not None or input_mask is not None else "text_only"
 
         task_name = None
@@ -537,6 +542,9 @@ def wrap_register_control_task(
                 input_source=input_source,
                 input_init=input_init,
                 input_mask=input_mask,
+                input_thumbnail=input_thumbnail,
+                input_width=input_width,
+                input_height=input_height,
             )
 
         task_runner.execute_pending_tasks_threading()
@@ -625,6 +633,8 @@ def wrap_register_video_task(ui_input_ids: Optional[List[Optional[str]]] = None)
             set_arg_value("video_last", last_image)
         else:
             set_arg_value("video_last", None)
+
+        named_args["input_thumbnail"] = create_input_thumbnail([init_image, last_image])
 
         named_args.pop("video_image", None)
         named_args.pop("video_last", None)
@@ -738,6 +748,12 @@ def wrap_register_ltx_task(ui_input_ids: Optional[List[Optional[str]]] = None):
             value = serialize_ltx_value(value)
             named_args[key] = value
             set_arg_value(key, value)
+
+        named_args["input_thumbnail"] = create_input_thumbnail([
+            named_args.get("ltx_init_image"),
+            named_args.get("ltx_last_image"),
+            named_args.get("ltx_condition_batch"),
+        ])
 
         condition_video = named_args.get("ltx_condition_video")
         if condition_video:
@@ -869,6 +885,7 @@ def get_task_results(task_id: str, image_idx: int = None):
     task = task_manager.get_task(task_id)
 
     galerry = None
+    video_html = None
     geninfo = None
     infotext = None
     if task is None:
@@ -881,6 +898,7 @@ def get_task_results(task_id: str, image_idx: int = None):
         try:
             result: dict = json.loads(task.result)
             images = result.get("images", [])
+            video_path = result.get("video", None)
             geninfo = result.get("geninfo", None)
             if isinstance(geninfo, dict):
                 infotexts = geninfo.get("infotexts", [])
@@ -888,10 +906,23 @@ def get_task_results(task_id: str, image_idx: int = None):
                 infotexts = result.get("infotexts", [])
                 geninfo = infotexts_to_geninfo(infotexts)
 
-            galerry = [Image.open(i) for i in images if os.path.exists(i)] if image_idx is None else gr.update()
+            if image_idx is None:
+                if video_path and os.path.exists(video_path):
+                    video_url = f"/agent-scheduler/v1/task/{quote(task_id, safe='')}/video"
+                    video_html = (
+                        '<div class="agent-scheduler-video-preview">'
+                        f'<video controls preload="metadata" src="{escape(video_url)}"></video>'
+                        '</div>'
+                    )
+                else:
+                    galerry = [Image.open(i) for i in images if os.path.exists(i)]
+            else:
+                galerry = gr.update()
             idx = image_idx if image_idx is not None else 0
             if idx < len(infotexts):
                 infotext = infotexts[idx]
+            elif result.get("result_txt"):
+                infotext = result.get("result_txt")
         except Exception as e:
             log.error(f"[AgentScheduler] Failed to load task result")
             log.error(e)
@@ -905,7 +936,8 @@ def get_task_results(task_id: str, image_idx: int = None):
     if image_idx is None:
         geninfo = json.dumps(geninfo) if geninfo else None
         res += (
-            galerry,
+            gr.update(value=galerry, visible=galerry is not None),
+            gr.HTML.update(video_html, visible=video_html is not None),
             gr.Textbox.update(geninfo),
             gr.File.update(None, visible=False),
             gr.HTML.update(None),
@@ -1044,6 +1076,10 @@ def on_ui_tab(**_kwargs):
                             preview=True,
                             object_fit="contain",
                         )
+                        video = gr.HTML(
+                            elem_id="agent_scheduler_history_video",
+                            visible=False,
+                        )
                         with gr.Row(
                             elem_id="agent_scheduler_history_result_actions",
                             visible=False,
@@ -1120,7 +1156,7 @@ def on_ui_tab(**_kwargs):
         selected_task.change(
             fn=lambda x: get_task_results(x, None),
             inputs=[selected_task],
-            outputs=[infotext, result_actions, galerry, generation_info, download_files, html_log],
+            outputs=[infotext, result_actions, galerry, video, generation_info, download_files, html_log],
         )
         selected_image_id.change(
             fn=lambda x, y: get_task_results(x, image_idx=int(y)),

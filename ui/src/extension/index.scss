@@ -147,6 +147,20 @@
   padding-bottom: calc(var(--ag-cell-horizontal-padding) - 1px);
 }
 
+.ag-cell.input-thumbnail-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.task-input-thumbnail {
+  width: 38px;
+  height: 38px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
+}
+
 button.ts-btn-action {
   display: inline-flex;
   justify-content: center;
@@ -315,6 +329,24 @@ button.ts-btn-action {
     width: 100%;
     height: 100%;
   }
+}
+
+.agent-scheduler-video-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  aspect-ratio: 1;
+
+  video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+}
+
+#agent_scheduler_history_video {
+  width: 100%;
 }
 
 #agent_scheduler_history_gallery {

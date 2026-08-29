@@ -44,6 +44,8 @@ from .task_helpers import (
     serialize_api_task_args,
     map_ui_task_args_list_to_named_args,
     map_named_args_to_ui_task_args_list,
+    create_input_thumbnail,
+    create_input_size,
 )
 
 
@@ -76,6 +78,9 @@ class ControlTaskArgs(BaseModel):
     input_source: Any = None
     input_init: Any = None
     input_mask: Any = None
+    input_thumbnail: Optional[str] = None
+    input_width: Optional[int] = None
+    input_height: Optional[int] = None
     checkpoint: Optional[str] = None
 
 
@@ -156,6 +161,10 @@ class TaskRunner:
         # loop through named_args and serialize images
         if is_img2img:
             serialize_img2img_image_args(named_args)
+            named_args["input_thumbnail"] = create_input_thumbnail(named_args)
+            input_size = create_input_size(named_args)
+            if input_size is not None:
+                named_args["input_width"], named_args["input_height"] = input_size
 
         if "request" in named_args:
             named_args["request"] = {"username": request.username}
@@ -183,6 +192,11 @@ class TaskRunner:
         named_args = serialize_api_task_args(api_args, is_img2img, checkpoint=checkpoint, vae=vae)
         checkpoint = get_dict_attribute(named_args, "override_settings.sd_model_checkpoint", None)
         script_args = named_args.pop("script_args", [])
+        if is_img2img:
+            named_args["input_thumbnail"] = create_input_thumbnail(named_args.get("init_images", []))
+            input_size = create_input_size(named_args.get("init_images", []))
+            if input_size is not None:
+                named_args["input_width"], named_args["input_height"] = input_size
 
         params = json.dumps(
             {
@@ -320,6 +334,9 @@ class TaskRunner:
             input_source=parsed.get("input_source", None),
             input_init=parsed.get("input_init", None),
             input_mask=parsed.get("input_mask", None),
+            input_thumbnail=parsed.get("input_thumbnail", None),
+            input_width=parsed.get("input_width", None),
+            input_height=parsed.get("input_height", None),
             checkpoint=parsed.get("checkpoint", None),
         )
 
@@ -415,6 +432,9 @@ class TaskRunner:
         input_source: Any = None,
         input_init: Any = None,
         input_mask: Any = None,
+        input_thumbnail: str = None,
+        input_width: int = None,
+        input_height: int = None,
     ):
         progress.add_task_to_queue(task_id)
 
@@ -429,6 +449,9 @@ class TaskRunner:
                 "input_source": input_source,
                 "input_init": input_init,
                 "input_mask": input_mask,
+                "input_thumbnail": input_thumbnail,
+                "input_width": input_width,
+                "input_height": input_height,
                 "checkpoint": checkpoint,
                 "is_ui": True,
             }

@@ -124,6 +124,25 @@ const sharedGridOptions: GridOptions<Task> = {
       editable: false,
     },
     {
+      field: 'params.input_thumbnail',
+      headerName: 'Input',
+      minWidth: 58,
+      maxWidth: 58,
+      editable: false,
+      filter: false,
+      sortable: false,
+      cellClass: 'input-thumbnail-cell',
+      cellRenderer: ({ value }: ICellRendererParams<Task, string | undefined>) => {
+        if (typeof value !== 'string' || value.length === 0) return '';
+        const image = document.createElement('img');
+        image.className = 'task-input-thumbnail';
+        image.src = value;
+        image.alt = 'Input thumbnail';
+        image.loading = 'lazy';
+        return image;
+      },
+    },
+    {
       field: 'editing',
       editable: false,
       hide: true,
