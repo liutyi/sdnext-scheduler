@@ -359,16 +359,8 @@ def bind_control_enqueue_button(root: gr.Blocks):
 
     dependency = max(dependencies, key=lambda d: len(d["inputs"]))
     fn_block = next(fn for fn in root.fns if compare_components_with_ids(fn.inputs, dependency["inputs"]))
-    control_inputs = fn_block.inputs.copy()
-    inputs = control_inputs.copy()
+    inputs = fn_block.inputs.copy()
     inputs.insert(0, control_checkpoint_dropdown)
-
-    select_inputs = []
-    select_dependency = next((d for d in dependencies if d is not dependency and len(d["outputs"]) == 4), None)
-    if select_dependency is not None:
-        select_fn_block = next(fn for fn in root.fns if compare_components_with_ids(fn.inputs, select_dependency["inputs"]))
-        select_inputs = select_fn_block.inputs.copy()
-        inputs.extend(select_inputs)
 
     def find_input_index(elem_id: str) -> Optional[int]:
         for idx, comp in enumerate(inputs):
@@ -384,8 +376,6 @@ def bind_control_enqueue_button(root: gr.Blocks):
             fn=wrap_register_control_task(
                 input_start_idx=input_start_idx,
                 ui_input_ids=input_ids,
-                control_input_count=len(control_inputs) + 1,
-                select_input_count=len(select_inputs),
             ),
             _js="submit_enqueue_control",
             inputs=inputs,
@@ -464,8 +454,6 @@ def bind_ltx_enqueue_button(root: gr.Blocks):
 def wrap_register_control_task(
     input_start_idx: Optional[int] = None,
     ui_input_ids: Optional[List[Optional[str]]] = None,
-    control_input_count: Optional[int] = None,
-    select_input_count: int = 0,
 ):
     def f(request: gr.Request, *args):
         if len(args) < 2:
@@ -486,10 +474,9 @@ def wrap_register_control_task(
         if not active_tab:
             active_tab = "control"
 
-        control_end_idx = control_input_count if control_input_count is not None else len(args)
-        control_args = list(args[start_idx:control_end_idx]) if len(args) > start_idx else []
+        control_args = list(args[start_idx:]) if len(args) > start_idx else []
         control_arg_ids = (
-            ui_input_ids[start_idx:control_end_idx] if ui_input_ids is not None and len(ui_input_ids) > start_idx else []
+            ui_input_ids[start_idx:] if ui_input_ids is not None and len(ui_input_ids) > start_idx else []
         )
         named_args = {
             elem_id: value
@@ -502,13 +489,6 @@ def wrap_register_control_task(
                 named_args[key] = int(value)
 
         from modules import ui_control_helpers as control_helpers
-
-        if select_input_count > 0 and len(args) >= control_end_idx:
-            select_args = args[control_end_idx:control_end_idx + select_input_count]
-            try:
-                control_helpers.select_input(*select_args)
-            except Exception as e:
-                log.warning(f"[AgentScheduler] control enqueue input selection failed: {e}")
 
         def serialize_control_value(value):
             if isinstance(value, list):

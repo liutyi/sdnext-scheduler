@@ -501,23 +501,6 @@ function initQueueHandler() {
     const component = components.find((comp) => comp?.props?.elem_id === elemId);
     return component?.id ?? null;
   };
-  const getDependencyInputsForTarget = (targetElemId: string) => {
-    const config = getGradioConfig();
-    const dependencies = config?.dependencies ?? [];
-    const targetId = getComponentIdByElemId(targetElemId);
-    if (targetId == null) return null;
-    const matchesTarget = (targets: unknown) => {
-      if (Array.isArray(targets)) {
-        return targets.some((target) => {
-          if (Array.isArray(target)) return target[0] === targetId;
-          return target === targetId;
-        });
-      }
-      return targets === targetId;
-    };
-    const dependency = dependencies.find((dep) => matchesTarget(dep?.targets));
-    return dependency?.inputs ?? null;
-  };
   const getDependencyInputsForTargetWithInput = (targetElemId: string, inputElemId: string) => {
     const config = getGradioConfig();
     const dependencies = config?.dependencies ?? [];
@@ -593,19 +576,6 @@ function initQueueHandler() {
     const res = create_submit_args(args);
     res[0] = getUiCheckpoint('control');
     res[1] = randomId();
-    const inputIds = getDependencyInputsForTarget('control_enqueue');
-    const inputTypeId = getComponentIdByElemId('control_input_type');
-    if (inputIds != null && inputTypeId != null) {
-      const occurrences = inputIds
-        .map((id, index) => (id === inputTypeId ? index : -1))
-        .filter(index => index >= 0);
-      const selectStart = occurrences.length > 1 ? occurrences[1] - 1 : -1;
-      if (selectStart >= 0 && selectStart < res.length) {
-        const [inputMode, ...inputArgs] = res.slice(selectStart);
-        const selectArgs = window.controlInputMode(inputMode, ...inputArgs);
-        res.splice(selectStart, selectArgs.length, ...selectArgs);
-      }
-    }
     window.randomId = window.origRandomId;
 
     if (btnControlEnqueue != null) {
