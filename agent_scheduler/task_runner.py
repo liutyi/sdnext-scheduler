@@ -99,7 +99,6 @@ class TaskRunner:
 
         self.__saved_images_path: List[str] = []
         script_callbacks.on_image_saved(self.__on_image_saved)
-        self.__control_ui_state = None
         self.__last_task_type = None
 
         self.script_callbacks = {
@@ -491,14 +490,6 @@ class TaskRunner:
         return task
 
     def execute_task(self, task: Task, get_next_task: Callable[[], Task]):
-        if self.__control_ui_state is None:
-            from modules import ui_control_helpers as control_helpers
-
-            self.__control_ui_state = (
-                control_helpers.input_source,
-                control_helpers.input_init,
-                control_helpers.input_mask,
-            )
         while True:
             if self.dispose:
                 break
@@ -625,10 +616,7 @@ class TaskRunner:
             if not task:
                 if not self.paused:
                     time.sleep(1)
-                    self.__restore_control_ui_state()
                     self.__on_completed()
-                else:
-                    self.__restore_control_ui_state()
                 break
 
     def __update_task_state(
@@ -836,6 +824,11 @@ class TaskRunner:
         input_init = resize_control_value(input_init)
         input_mask = resize_control_value(input_mask)
 
+        previous_control_state = (
+            control_helpers.input_source,
+            control_helpers.input_init,
+            control_helpers.input_mask,
+        )
         control_helpers.input_source = input_source
         control_helpers.input_init = input_init
         control_helpers.input_mask = input_mask
@@ -881,6 +874,17 @@ class TaskRunner:
             finally:
                 progress.finish_task(task_id)
                 shared.state.end()
+                # Preserve inputs changed in the UI while this queued task was running.
+                if (
+                    control_helpers.input_source is input_source
+                    and control_helpers.input_init is input_init
+                    and control_helpers.input_mask is input_mask
+                ):
+                    (
+                        control_helpers.input_source,
+                        control_helpers.input_init,
+                        control_helpers.input_mask,
+                    ) = previous_control_state
 
         if isinstance(res, Exception):
             return res
@@ -1040,18 +1044,6 @@ class TaskRunner:
             return RuntimeError(result_txt or "LTX generation failed")
 
         return {"video": video_path, "geninfo": None, "result_txt": result_txt}
-
-    def __restore_control_ui_state(self):
-        if self.__control_ui_state is None:
-            return
-        from modules import ui_control_helpers as control_helpers
-
-        (
-            control_helpers.input_source,
-            control_helpers.input_init,
-            control_helpers.input_mask,
-        ) = self.__control_ui_state
-        self.__control_ui_state = None
 
     def __execute_api_task(self, task_id: str, is_img2img: bool, **kwargs):
         progress.start_task(task_id)
