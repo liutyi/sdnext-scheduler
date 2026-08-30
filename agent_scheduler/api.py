@@ -2,6 +2,7 @@ import io
 import os
 import json
 import base64
+import mimetypes
 import requests
 import threading
 from uuid import uuid4
@@ -14,7 +15,7 @@ from collections import defaultdict
 from gradio.routes import App
 from PIL import Image
 from fastapi import Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
@@ -158,6 +159,27 @@ def regsiter_apis(app: App, task_runner: TaskRunner):
 
         return QueueTaskResponse(task_id=task_id)
 
+    def as_number(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def as_int(value):
+        number = as_number(value)
+        return int(number) if number is not None else None
+
+    def has_resize_method(value):
+        return value not in (None, "", "None")
+
+    def scaled_input_size(width, height, scale):
+        width = as_number(width)
+        height = as_number(height)
+        scale = as_number(scale)
+        if width is None or height is None or scale is None:
+            return None
+        return int(width * scale), int(height * scale)
+
     def format_task_args(task):
         if task.type == "control":
             try:
@@ -185,6 +207,23 @@ def regsiter_apis(app: App, task_runner: TaskRunner):
                 sd_samplers.set_samplers()
                 if 0 <= sampler_index < len(sd_samplers.samplers):
                     sampler_name = sd_samplers.samplers[sampler_index].name
+            width = args_map.get("control_before_resize_width", None)
+            height = args_map.get("control_before_resize_height", None)
+            selected_scale_tab = args_map.get("control_before_selected_scale_tab", None)
+            scale_by = as_number(args_map.get("control_before_scale", 1))
+            if (
+                (as_int(selected_scale_tab) == 1 or (selected_scale_tab is None and scale_by is not None and scale_by != 1))
+                and has_resize_method(args_map.get("control_before_resize_name", None))
+                and control_args.input_width is not None
+                and control_args.input_height is not None
+            ):
+                effective_size = scaled_input_size(
+                    control_args.input_width,
+                    control_args.input_height,
+                    args_map.get("control_before_scale", 1),
+                )
+                if effective_size is not None:
+                    width, height = effective_size
             return {
                 "checkpoint": control_args.checkpoint,
                 "prompt": args_map.get("control_prompt", ""),
@@ -192,11 +231,12 @@ def regsiter_apis(app: App, task_runner: TaskRunner):
                 "sampler_name": sampler_name,
                 "steps": args_map.get("control_steps", None),
                 "cfg_scale": args_map.get("control_cfg_scale", None),
-                "width": args_map.get("control_before_resize_width", None),
-                "height": args_map.get("control_before_resize_height", None),
+                "width": width,
+                "height": height,
                 "n_iter": args_map.get("control_batch_count", None),
                 "batch_size": args_map.get("control_batch_size", None),
                 "control_mode": control_args.control_mode,
+                "input_thumbnail": control_args.input_thumbnail,
             }
         if task.type == "video_text":
             try:
@@ -236,10 +276,67 @@ def regsiter_apis(app: App, task_runner: TaskRunner):
                 "video_mode": video_args.video_mode,
                 "video_engine": args_map.get("video_engine", None),
                 "video_model": args_map.get("video_model", None),
+                "has_init_image": bool(args_map.get("has_init_image", False)),
+                "has_last_image": bool(args_map.get("has_last_image", False)),
+                "input_thumbnail": args_map.get("input_thumbnail", None),
+            }
+        if task.type == "video_ltx":
+            try:
+                video_args = TaskRunner.instance.parse_video_task_args(task)
+            except ValueError:
+                return {
+                    "checkpoint": None,
+                    "prompt": "",
+                    "negative_prompt": "",
+                    "sampler_name": None,
+                    "steps": None,
+                    "cfg_scale": None,
+                    "width": None,
+                    "height": None,
+                    "frames": None,
+                    "video_mode": None,
+                }
+            args_map = video_args.named_args or {}
+            sampler_index = args_map.get("ltx_sampling", None)
+            if isinstance(sampler_index, float):
+                sampler_index = int(sampler_index)
+            sampler_name = None
+            if isinstance(sampler_index, int):
+                sd_samplers.set_samplers()
+                if 0 <= sampler_index < len(sd_samplers.samplers):
+                    sampler_name = sd_samplers.samplers[sampler_index].name
+            return {
+                "checkpoint": None,
+                "prompt": args_map.get("video_prompt", ""),
+                "negative_prompt": args_map.get("video_neg_prompt", ""),
+                "sampler_name": sampler_name,
+                "steps": args_map.get("ltx_steps", None),
+                "cfg_scale": args_map.get("ltx_guidance_scale", None),
+                "width": args_map.get("ltx_width", None),
+                "height": args_map.get("ltx_height", None),
+                "frames": args_map.get("ltx_frames", None),
+                "video_mode": video_args.video_mode,
+                "ltx_model": args_map.get("ltx_model", None),
+                "input_thumbnail": args_map.get("input_thumbnail", None),
             }
         task_args = TaskRunner.instance.parse_task_args(task, deserialization=False)
         named_args = task_args.named_args
         named_args["checkpoint"] = task_args.checkpoint
+        if task.type == "img2img":
+            selected_scale_tab = named_args.get("selected_scale_tab", None)
+            if (
+                as_int(selected_scale_tab) == 1
+                and as_int(named_args.get("resize_mode", 0)) != 0
+                and named_args.get("input_width", None) is not None
+                and named_args.get("input_height", None) is not None
+            ):
+                effective_size = scaled_input_size(
+                    named_args.get("input_width", None),
+                    named_args.get("input_height", None),
+                    named_args.get("scale_by", 1),
+                )
+                if effective_size is not None:
+                    named_args["width"], named_args["height"] = effective_size
         # remove unused args to reduce payload size
         named_args.pop("alwayson_scripts", None)
         named_args.pop("script_args", None)
@@ -447,6 +544,42 @@ def regsiter_apis(app: App, task_runner: TaskRunner):
                         set_arg_value("video_sampling", sampler_index)
                 params["args"] = named_args
                 params["args_values"] = args_values
+            elif task.type == "video_ltx":
+                named_args = params.get("args", {})
+                args_order = params.get("args_order", [])
+                args_values = params.get("args_values", [])
+
+                def set_arg_value(key: str, value: Any):
+                    if key in args_order:
+                        idx = args_order.index(key)
+                        if len(args_values) <= idx:
+                            args_values.extend([None] * (idx + 1 - len(args_values)))
+                        args_values[idx] = value
+
+                if body.params:
+                    if "prompt" in body.params:
+                        named_args["video_prompt"] = body.params["prompt"]
+                        set_arg_value("video_prompt", body.params["prompt"])
+                    if "negative_prompt" in body.params:
+                        named_args["video_neg_prompt"] = body.params["negative_prompt"]
+                        set_arg_value("video_neg_prompt", body.params["negative_prompt"])
+                    if "steps" in body.params:
+                        named_args["ltx_steps"] = body.params["steps"]
+                        set_arg_value("ltx_steps", body.params["steps"])
+                    if "cfg_scale" in body.params:
+                        named_args["ltx_guidance_scale"] = body.params["cfg_scale"]
+                        set_arg_value("ltx_guidance_scale", body.params["cfg_scale"])
+                    sampler_name = body.params.get("sampler_name", None)
+                    if sampler_name is not None:
+                        sd_samplers.set_samplers()
+                        sampler_index = next(
+                            (i for i, s in enumerate(sd_samplers.samplers) if s.name == sampler_name),
+                            0,
+                        )
+                        named_args["ltx_sampling"] = sampler_index
+                        set_arg_value("ltx_sampling", sampler_index)
+                params["args"] = named_args
+                params["args_values"] = args_values
             else:
                 if body.checkpoint is not None:
                     params["checkpoint"] = body.checkpoint
@@ -639,6 +772,28 @@ def regsiter_apis(app: App, task_runner: TaskRunner):
             ]
 
             return {"success": True, "data": data}
+
+    @app.get("/agent-scheduler/v1/task/{id}/video", dependencies=deps)
+    def get_task_video(id: str):
+        task = task_manager.get_task(id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task.status != TaskStatus.DONE:
+            raise HTTPException(status_code=409, detail=f"Task is {task.status}")
+        if task.result is None:
+            raise HTTPException(status_code=404, detail="Task result is not available")
+
+        result: dict = json.loads(task.result)
+        video = result.get("video", None)
+        if not video or not Path(video).is_file():
+            raise HTTPException(status_code=404, detail="Task video is not available")
+
+        media_type = mimetypes.guess_type(video)[0] or "video/mp4"
+        return FileResponse(
+            video,
+            media_type=media_type,
+            headers={"Content-Disposition": f'inline; filename="{Path(video).name}"'},
+        )
 
     @app.post("/agent-scheduler/v1/pause", dependencies=deps, deprecated=True)
     @app.post("/agent-scheduler/v1/queue/pause", dependencies=deps)

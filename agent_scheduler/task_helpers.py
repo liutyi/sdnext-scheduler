@@ -1,4 +1,5 @@
 import io
+import os
 import zlib
 import base64
 import pickle
@@ -132,6 +133,95 @@ def deserialize_image(image_str):
             return Image.frombytes(mode, size, data)
     else:
         return image_str
+
+
+def find_first_image(value):
+    if value is None:
+        return None
+    if isinstance(value, Image.Image):
+        return value
+    if isinstance(value, (np.ndarray, torch.Tensor)):
+        return value
+    if isinstance(value, str):
+        try:
+            if value.startswith("data:image/"):
+                value = value.split(",", 1)[1]
+            if os.path.isfile(value):
+                return Image.open(value)
+            return Image.open(io.BytesIO(base64.b64decode(value)))
+        except Exception:
+            return None
+    if isinstance(value, dict):
+        if value.get("cls", None) in ("Image", "ndarray", "Tensor"):
+            try:
+                image = deserialize_image(value)
+                return image if isinstance(image, (Image.Image, np.ndarray, torch.Tensor)) else None
+            except Exception as e:
+                log.debug(f"[AgentScheduler] Failed to deserialize input thumbnail image: {e}")
+                return None
+        for nested in value.values():
+            image = find_first_image(nested)
+            if image is not None:
+                return image
+    if isinstance(value, list):
+        for nested in value:
+            image = find_first_image(nested)
+            if image is not None:
+                return image
+    return None
+
+
+def create_input_thumbnail(value, size: int = 40):
+    image = find_first_image(value)
+    if image is None:
+        return None
+    try:
+        if isinstance(image, torch.Tensor):
+            image = image.detach().cpu().numpy()
+        if isinstance(image, np.ndarray):
+            if image.ndim == 3 and image.shape[0] in (1, 3, 4) and image.shape[0] < image.shape[-1]:
+                image = np.moveaxis(image, 0, -1)
+            image = Image.fromarray(image.astype("uint8"))
+        if not isinstance(image, Image.Image):
+            return None
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        image.thumbnail((size, size), Image.Resampling.LANCZOS)
+        with io.BytesIO() as output_bytes:
+            try:
+                image.save(output_bytes, format="WEBP", quality=70)
+                mime_type = "image/webp"
+            except Exception:
+                output_bytes.seek(0)
+                output_bytes.truncate(0)
+                image.save(output_bytes, format="PNG")
+                mime_type = "image/png"
+            return f"data:{mime_type};base64," + base64.b64encode(output_bytes.getvalue()).decode("utf-8")
+    except Exception as e:
+        log.debug(f"[AgentScheduler] Failed to create input thumbnail: {e}")
+        return None
+
+
+def create_input_size(value):
+    image = find_first_image(value)
+    if image is None:
+        return None
+    try:
+        if isinstance(image, Image.Image):
+            return image.size
+        if isinstance(image, torch.Tensor):
+            shape = tuple(image.shape)
+        elif isinstance(image, np.ndarray):
+            shape = image.shape
+        else:
+            return None
+        if len(shape) < 2:
+            return None
+        if len(shape) == 3 and shape[0] in (1, 3, 4) and shape[0] < shape[-1]:
+            return int(shape[2]), int(shape[1])
+        return int(shape[1]), int(shape[0])
+    except Exception as e:
+        log.debug(f"[AgentScheduler] Failed to read input image size: {e}")
+        return None
 
 
 def serialize_img2img_image_args(args: Dict):

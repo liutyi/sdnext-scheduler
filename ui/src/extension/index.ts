@@ -2,6 +2,7 @@ import {
   CellClassParams,
   CellClickedEvent,
   createGrid,
+  EditableCallbackParams,
   GridApi,
   GridOptions,
   ICellRendererParams,
@@ -42,7 +43,6 @@ declare global {
   function gradioApp(): HTMLElement;
   function randomId(): string;
   function origRandomId(): string;
-  function get_tab_index(name: string): number;
   function create_submit_args(args: any[]): any[];
   function requestProgress(
     id: string,
@@ -60,6 +60,8 @@ declare global {
   function submit_enqueue_img2img(...args: any[]): any[];
   function submit_enqueue_control(...args: any[]): any[];
   function submit_enqueue_video(...args: any[]): any[];
+  function submit_enqueue_ltx(...args: any[]): any[];
+  function controlInputMode(inputMode: string, ...args: any[]): any[];
   function agent_scheduler_status_filter_changed(value: string): void;
   function appendContextMenuOption(selector: string, label: string, callback: () => void): void;
   function modalSaveImage(event: Event): void;
@@ -70,17 +72,20 @@ const sharedStore = createSharedStore({
   selectedTab: 'pending',
 });
 
-const pendingStore = createPendingTasksStore({
-  current_task_id: null,
-  total_pending_tasks: 0,
-  pending_tasks: [],
-  paused: false,
-});
-
 const historyStore = createHistoryTasksStore({
   total: 0,
   tasks: [],
 });
+
+const pendingStore = createPendingTasksStore(
+  {
+    current_task_id: null,
+    total_pending_tasks: 0,
+    pending_tasks: [],
+    paused: false,
+  },
+  historyStore
+);
 
 // load samplers and checkpoints
 const samplers: string[] = [];
@@ -119,6 +124,25 @@ const sharedGridOptions: GridOptions<Task> = {
       editable: false,
     },
     {
+      field: 'params.input_thumbnail',
+      headerName: 'Input',
+      minWidth: 58,
+      maxWidth: 58,
+      editable: false,
+      filter: false,
+      sortable: false,
+      cellClass: 'input-thumbnail-cell',
+      cellRenderer: ({ value }: ICellRendererParams<Task, string | undefined>) => {
+        if (typeof value !== 'string' || value.length === 0) return '';
+        const image = document.createElement('img');
+        image.className = 'task-input-thumbnail';
+        image.src = value;
+        image.alt = 'Input thumbnail';
+        image.loading = 'lazy';
+        return image;
+      },
+    },
+    {
       field: 'editing',
       editable: false,
       hide: true,
@@ -152,21 +176,31 @@ const sharedGridOptions: GridOptions<Task> = {
           cellDataType: 'text',
           minWidth: 150,
           maxWidth: 300,
-          editable: (params: ValueFormatterParams<Task, string | undefined>) => {
-            const isVideoTask = params.data?.type === 'video_text' || !!params.data?.params?.video_model;
+          editable: (params: EditableCallbackParams<Task>) => {
+            const isVideoTask =
+              params.data?.type === 'video_text' ||
+              params.data?.type === 'video_ltx' ||
+              params.data?.params?.video_model != null ||
+              params.data?.params?.ltx_model != null;
             return !isVideoTask;
           },
           valueFormatter: ({ data, value }: ValueFormatterParams<Task, string | undefined>) => {
             const isVideoTask = data?.type === 'video_text';
-            const rawModel = data?.params?.video_model ?? null;
-            const rawEngine = data?.params?.video_engine ?? null;
-            const model = rawModel && rawModel !== 'None' ? rawModel : null;
-            const engine = rawEngine && rawEngine !== 'None' ? rawEngine : null;
+            const isLtxTask = data?.type === 'video_ltx';
+            const rawModel = data?.params?.video_model;
+            const rawEngine = data?.params?.video_engine;
+            const rawLtxModel = data?.params?.ltx_model;
+            const model = typeof rawModel === 'string' && rawModel !== '' && rawModel !== 'None' ? rawModel : null;
+            const engine = typeof rawEngine === 'string' && rawEngine !== '' && rawEngine !== 'None' ? rawEngine : null;
+            const ltxModel = typeof rawLtxModel === 'string' && rawLtxModel !== '' && rawLtxModel !== 'None' ? rawLtxModel : null;
             if (isVideoTask) {
-              if (model) {
+              if (model != null) {
                 return `${engine ?? 'Video'}: ${model}`;
               }
               return 'Video: (unset)';
+            }
+            if (isLtxTask) {
+              return ltxModel != null ? `LTX: ${ltxModel}` : 'LTX: (unset)';
             }
             return value ?? 'System';
           },
@@ -313,6 +347,21 @@ async function notify(response: ResponseStatus) {
 window.notify = notify;
 window.origRandomId = window.randomId;
 
+async function notifyEnqueueResult() {
+  await pendingStore.refresh();
+  const state = pendingStore.getState();
+  const pending = state.total_pending_tasks;
+  const pendingMessage = pending > 0 ? ` Pending jobs: ${pending}.` : '';
+  const stateMessage = state.paused ? 'Queue is PAUSED.' : 'Queue is executing.';
+  await notify({ success: true, message: `Task queued. ${stateMessage}${pendingMessage}` });
+}
+
+function refreshQueueAfterEnqueue() {
+  setTimeout(() => {
+    void notifyEnqueueResult();
+  }, 1000);
+}
+
 function showTaskProgress(task_id: string, type: string | undefined, callback: () => void) {
   // delay progress request until the options loaded
   if (Object.keys(opts).length === 0) {
@@ -378,15 +427,88 @@ function initQueueHandler() {
     );
     return setting_sd_model?.value ?? 'Current Checkpoint';
   };
-  const getInputValue = (elemId: string) => {
-    const el = gradioApp().querySelector<HTMLInputElement>(`#${elemId} input`);
-    return el?.value ?? null;
+  const queueSkipTask = '$$_queue_skip_$$';
+  const queueErrorPrefix = '$$_queue_error_$$';
+  const isQueuedTaskId = (taskId: unknown) =>
+    typeof taskId === 'string' && taskId !== queueSkipTask && !taskId.startsWith(queueErrorPrefix);
+  const isElementVisible = (elemId: string) => {
+    const el = gradioApp().querySelector<HTMLElement>(`#${elemId}`);
+    return el != null && el.getClientRects().length > 0;
   };
-  const getSliderValue = (elemId: string) => {
-    const el = gradioApp().querySelector<HTMLInputElement>(`#${elemId} input`);
-    if (!el) return null;
-    const value = Number.parseFloat(el.value);
-    return Number.isNaN(value) ? null : value;
+  const getInputValue = (elemId: string) => {
+    const input = gradioApp().querySelector<HTMLInputElement>(`#${elemId} input`);
+    return input?.value?.trim() ?? '';
+  };
+  const hasValue = (value: string) => value !== '' && value !== 'None';
+  const getTabIndex = (name: string) => {
+    const globalGetTabIndex = (window as any).get_tab_index;
+    if (typeof globalGetTabIndex === 'function') {
+      return globalGetTabIndex(name);
+    }
+
+    const tabs = gradioApp().querySelector<HTMLElement>(`#${name}`);
+    const tabButtons = Array.from(tabs?.querySelectorAll<HTMLElement>('[role="tab"]') ?? []);
+    const selected = tabButtons.findIndex(tab => tab.getAttribute('aria-selected') === 'true');
+    return selected;
+  };
+  const isGenericVideoTab = () => isElementVisible('video_settings');
+  const isLtxVideoTab = () => isElementVisible('ltx_settings');
+  type VideoTarget = 'video' | 'ltx';
+  type VideoTargetError = { error: string; target?: VideoTarget };
+  type VideoSelections = { videoEngine?: unknown; videoModel?: unknown; ltxModel?: unknown };
+  const getSelectionValue = (value: unknown, elemId: string) => {
+    if (typeof value === 'string') return value.trim();
+    return getInputValue(elemId);
+  };
+  const resolveVideoTarget = (selections: VideoSelections = {}): VideoTarget | VideoTargetError => {
+    if (isGenericVideoTab()) {
+      const engine = getSelectionValue(selections.videoEngine, 'video_engine');
+      const model = getSelectionValue(selections.videoModel, 'video_model');
+      if (hasValue(engine) && hasValue(model)) {
+        return 'video';
+      }
+      return { error: 'Select a video model before enqueueing a video task.', target: 'video' };
+    }
+    if (isLtxVideoTab()) {
+      const model = getSelectionValue(selections.ltxModel, 'ltx_model');
+      if (hasValue(model)) {
+        return 'ltx';
+      }
+      return { error: 'Select an LTX model before enqueueing a video task.', target: 'ltx' };
+    }
+
+    const configured: VideoTarget[] = [];
+    if (hasValue(getInputValue('video_engine')) && hasValue(getInputValue('video_model'))) {
+      configured.push('video');
+    }
+    if (hasValue(getInputValue('ltx_model'))) {
+      configured.push('ltx');
+    }
+
+    if (configured.length === 0) {
+      return { error: 'Select a video model before enqueueing a video task.' };
+    }
+    if (configured.length > 1) {
+      return {
+        error: 'Multiple video models are selected; open the specific model tab or select only one model before enqueueing.',
+      };
+    }
+    return configured[0] as 'video' | 'ltx';
+  };
+  const setVideoTaskId = (target: VideoTarget, expected: VideoTarget) => {
+    if (target === expected) return randomId();
+    return queueSkipTask;
+  };
+  const handleVideoTargetError = ({ error, target }: VideoTargetError, handler: VideoTarget) => {
+    if (target != null && target !== handler) {
+      return queueSkipTask;
+    }
+    if (target == null && handler !== 'video') {
+      return queueSkipTask;
+    }
+    console.error(`[AgentScheduler] ${error}`);
+    notify({ success: false, message: error });
+    return `${queueErrorPrefix}${error}`;
   };
   const getGradioConfig = () => (window as any).gradio_config as {
     components?: Array<{ id?: number; props?: { elem_id?: string } }>;
@@ -398,11 +520,12 @@ function initQueueHandler() {
     const component = components.find((comp) => comp?.props?.elem_id === elemId);
     return component?.id ?? null;
   };
-  const getDependencyInputsForTarget = (targetElemId: string) => {
+  const getDependencyInputsForTargetWithInput = (targetElemId: string, inputElemId: string) => {
     const config = getGradioConfig();
     const dependencies = config?.dependencies ?? [];
     const targetId = getComponentIdByElemId(targetElemId);
-    if (targetId == null) return null;
+    const inputId = getComponentIdByElemId(inputElemId);
+    if (targetId == null || inputId == null) return null;
     const matchesTarget = (targets: unknown) => {
       if (Array.isArray(targets)) {
         return targets.some((target) => {
@@ -412,37 +535,33 @@ function initQueueHandler() {
       }
       return targets === targetId;
     };
-    const dependency = dependencies.find((dep) => matchesTarget(dep?.targets));
+    const dependency = dependencies.find(
+      (dep) => matchesTarget(dep?.targets) && Array.isArray(dep?.inputs) && dep.inputs.includes(inputId)
+    );
     return dependency?.inputs ?? null;
   };
-  const getVideoInputIndex = (inputElemId: string) => {
-    const inputs =
-      getDependencyInputsForTarget('video_enqueue') ??
-      getDependencyInputsForTarget('video_generate_btn') ??
-      getDependencyInputsForTarget('video_generate');
-    if (!inputs) return null;
+  const getSubmitValue = (res: any[], targetElemId: string, inputElemId: string) => {
+    const inputs = getDependencyInputsForTargetWithInput(targetElemId, inputElemId);
+    if (inputs == null) return undefined;
     const inputId = getComponentIdByElemId(inputElemId);
-    if (inputId == null) return null;
-    const index = inputs.indexOf(inputId);
-    return index === -1 ? null : index;
+    const index = inputId == null ? -1 : inputs.indexOf(inputId);
+    return index >= 0 && index < res.length ? res[index] : undefined;
   };
 
   const btnEnqueue = gradioApp().querySelector<HTMLButtonElement>('#txt2img_enqueue')!;
   window.submit_enqueue = (...args) => {
     const res = create_submit_args(args);
+    const state = res[1];
     res[0] = getUiCheckpoint('txt2img');
     res[1] = randomId();
+    res.splice(2, 0, state);
     window.randomId = window.origRandomId;
 
     if (btnEnqueue != null) {
       btnEnqueue.innerText = 'Queued';
       setTimeout(() => {
         btnEnqueue.innerText = 'Enqueue';
-        if (!sharedStore.getState().uiAsTab) {
-          if (sharedStore.getState().selectedTab === 'pending') {
-            pendingStore.refresh();
-          }
-        }
+        void notifyEnqueueResult();
       }, 1000);
     }
 
@@ -452,20 +571,19 @@ function initQueueHandler() {
   const btnImg2ImgEnqueue = gradioApp().querySelector<HTMLButtonElement>('#img2img_enqueue')!;
   window.submit_enqueue_img2img = (...args) => {
     const res = create_submit_args(args);
+    const state = res[1];
+    const mode = getTabIndex('mode_img2img');
     res[0] = getUiCheckpoint('img2img');
     res[1] = randomId();
-    res[2] = get_tab_index('mode_img2img');
+    res.splice(2, 0, state);
+    res[3] = mode;
     window.randomId = window.origRandomId;
 
     if (btnImg2ImgEnqueue != null) {
       btnImg2ImgEnqueue.innerText = 'Queued';
       setTimeout(() => {
         btnImg2ImgEnqueue.innerText = 'Enqueue';
-        if (!sharedStore.getState().uiAsTab) {
-          if (sharedStore.getState().selectedTab === 'pending') {
-            pendingStore.refresh();
-          }
-        }
+        void notifyEnqueueResult();
       }, 1000);
     }
 
@@ -480,13 +598,7 @@ function initQueueHandler() {
     window.randomId = window.origRandomId;
 
     if (btnControlEnqueue != null) {
-      setTimeout(() => {
-        if (!sharedStore.getState().uiAsTab) {
-          if (sharedStore.getState().selectedTab === 'pending') {
-            pendingStore.refresh();
-          }
-        }
-      }, 1000);
+      refreshQueueAfterEnqueue();
     }
 
     return res;
@@ -495,42 +607,36 @@ function initQueueHandler() {
   const btnVideoEnqueue = gradioApp().querySelector<HTMLButtonElement>('#video_enqueue');
   window.submit_enqueue_video = (...args) => {
     const res = create_submit_args(args);
+    const target = resolveVideoTarget({
+      videoEngine: getSubmitValue(res, 'video_enqueue', 'video_engine'),
+      videoModel: getSubmitValue(res, 'video_enqueue', 'video_model'),
+    });
     res[0] = getUiCheckpoint('video');
-    res[1] = randomId();
+    res[1] = typeof target === 'string'
+      ? setVideoTaskId(target, 'video')
+      : handleVideoTargetError(target, 'video');
     window.randomId = window.origRandomId;
-    const videoEngine = getInputValue('video_engine');
-    const videoModel = getInputValue('video_model');
-    const engineIndex = getVideoInputIndex('video_engine');
-    const modelIndex = getVideoInputIndex('video_model');
-    const stepsIndex = getVideoInputIndex('video_steps');
-    if (engineIndex != null && engineIndex >= 0) {
-      if (engineIndex >= res.length) res.length = engineIndex + 1;
-      res[engineIndex] = videoEngine;
-    }
-    if (videoEngine === 'LTX Video') {
-      const ltxModel = getInputValue('ltx_model');
-      const ltxSteps = getSliderValue('ltx_steps');
-      if (modelIndex != null && modelIndex >= 0) {
-        if (modelIndex >= res.length) res.length = modelIndex + 1;
-        res[modelIndex] = ltxModel;
-      }
-      if (stepsIndex != null && stepsIndex >= 0) {
-        if (stepsIndex >= res.length) res.length = stepsIndex + 1;
-        res[stepsIndex] = ltxSteps;
-      }
-    } else if (modelIndex != null && modelIndex >= 0) {
-      if (modelIndex >= res.length) res.length = modelIndex + 1;
-      res[modelIndex] = videoModel;
+
+    if (btnVideoEnqueue != null && isQueuedTaskId(res[1])) {
+      refreshQueueAfterEnqueue();
     }
 
-    if (btnVideoEnqueue != null) {
-      setTimeout(() => {
-        if (!sharedStore.getState().uiAsTab) {
-          if (sharedStore.getState().selectedTab === 'pending') {
-            pendingStore.refresh();
-          }
-        }
-      }, 1000);
+    return res;
+  };
+
+  window.submit_enqueue_ltx = (...args) => {
+    const res = create_submit_args(args);
+    const target = resolveVideoTarget({
+      ltxModel: getSubmitValue(res, 'video_enqueue', 'ltx_model'),
+    });
+    res[0] = getUiCheckpoint('video');
+    res[1] = typeof target === 'string'
+      ? setVideoTaskId(target, 'ltx')
+      : handleVideoTargetError(target, 'ltx');
+    window.randomId = window.origRandomId;
+
+    if (btnVideoEnqueue != null && isQueuedTaskId(res[1])) {
+      refreshQueueAfterEnqueue();
     }
 
     return res;
@@ -560,7 +666,7 @@ function initQueueHandler() {
       e.preventDefault();
       e.stopPropagation();
 
-      const activeTab = get_tab_index('tabs');
+      const activeTab = getTabIndex('tabs');
       if (activeTab === 0) {
         btnEnqueue.click();
       } else if (activeTab === 1) {
