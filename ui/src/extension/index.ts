@@ -447,9 +447,11 @@ function initQueueHandler() {
     }
 
     const tabs = gradioApp().querySelector<HTMLElement>(`#${name}`);
-    const tabButtons = Array.from(tabs?.querySelectorAll<HTMLElement>('[role="tab"]') ?? []);
-    const selected = tabButtons.findIndex(tab => tab.getAttribute('aria-selected') === 'true');
-    return selected;
+    const tabButtons = Array.from(tabs?.querySelectorAll<HTMLElement>('button') ?? []);
+    const selected = tabButtons.findIndex(
+      tab => tab.getAttribute('aria-selected') === 'true' || tab.classList.contains('selected')
+    );
+    return selected >= 0 ? selected : 0;
   };
   const isGenericVideoTab = () => isElementVisible('video_settings');
   const isLtxVideoTab = () => isElementVisible('ltx_settings');
@@ -551,10 +553,8 @@ function initQueueHandler() {
   const btnEnqueue = gradioApp().querySelector<HTMLButtonElement>('#txt2img_enqueue')!;
   window.submit_enqueue = (...args) => {
     const res = create_submit_args(args);
-    const state = res[1];
     res[0] = getUiCheckpoint('txt2img');
     res[1] = randomId();
-    res.splice(2, 0, state);
     window.randomId = window.origRandomId;
 
     if (btnEnqueue != null) {
@@ -571,11 +571,9 @@ function initQueueHandler() {
   const btnImg2ImgEnqueue = gradioApp().querySelector<HTMLButtonElement>('#img2img_enqueue')!;
   window.submit_enqueue_img2img = (...args) => {
     const res = create_submit_args(args);
-    const state = res[1];
     const mode = getTabIndex('mode_img2img');
     res[0] = getUiCheckpoint('img2img');
     res[1] = randomId();
-    res.splice(2, 0, state);
     res[3] = mode;
     window.randomId = window.origRandomId;
 
