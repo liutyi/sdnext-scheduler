@@ -338,6 +338,10 @@ def map_ui_task_args_list_to_named_args(args: List, is_img2img: bool):
         args.insert(arg_names.index("request"), None)
 
     named_args = dict(zip(arg_names, args[0 : len(arg_names)]))
+    log.debug(f"AS args: total={len(args)} names={len(arg_names)} "
+          f"prompt={named_args.get('prompt')!r} steps={named_args.get('steps')!r} "
+          f"sampler_index={named_args.get('sampler_index')!r}")
+    log.debug("AS args: " + ", ".join(f"{k}:{type(v).__name__}" for k, v in named_args.items()))
     script_args = args[len(arg_names) :]
 
     override_settings_texts: List[str] = named_args.get("override_settings_texts", [])
@@ -352,15 +356,30 @@ def map_ui_task_args_list_to_named_args(args: List, is_img2img: bool):
     sampler_index = named_args.get("sampler_index", None)
     if sampler_index is not None:
         available_samplers = sd_samplers.samplers_for_img2img if is_img2img else sd_samplers.samplers
-        sampler_name = available_samplers[named_args["sampler_index"]].name
+        if isinstance(sampler_index, int):
+            sampler_name = available_samplers[sampler_index].name
+        else:
+            sampler_name = str(sampler_index)
+            if sampler_name not in [x.name for x in available_samplers]:
+                log.warning(f"agent-scheduler: unknown sampler {sampler_name!r}")
         named_args["sampler_name"] = sampler_name
         log.debug(f"serialize sampler index: {str(sampler_index)} as {sampler_name}")
+
+    hr_sampler_index = named_args.get("hr_sampler_index", None)
+    if hr_sampler_index is not None:
+        available_samplers = sd_samplers.samplers_for_img2img if is_img2img else sd_samplers.samplers
+        if isinstance(hr_sampler_index, int):
+            hr_sampler_name = available_samplers[hr_sampler_index].name
+        else:
+            hr_sampler_name = str(hr_sampler_index)
+            if hr_sampler_name not in [x.name for x in available_samplers]:
+                log.warning(f"agent-scheduler: unknown hr sampler {hr_sampler_name!r}")
+        named_args["hr_sampler_name"] = hr_sampler_name
 
     return (
         named_args,
         script_args,
     )
-
 
 def map_named_args_to_ui_task_args_list(named_args: Dict, script_args: List, is_img2img: bool):
     fn = (
@@ -372,15 +391,16 @@ def map_named_args_to_ui_task_args_list(named_args: Dict, script_args: List, is_
 
     sampler_name = named_args.get("sampler_name", None)
     if sampler_name is not None:
-        available_samplers = sd_samplers.samplers_for_img2img if is_img2img else sd_samplers.samplers
-        sampler_index = next((i for i, x in enumerate(available_samplers) if x.name == sampler_name), 0)
-        named_args["sampler_index"] = sampler_index
+        named_args["sampler_index"] = sampler_name  # SD.Next now expects the name here
+
+    hr_sampler_name = named_args.get("hr_sampler_name", None)
+    if hr_sampler_name is not None:
+        named_args["hr_sampler_index"] = hr_sampler_name
 
     args = [named_args.get(name, None) for name in arg_names]
     args.extend(script_args)
 
     return args
-
 
 def map_script_args_list_to_named(script: scripts.Script, args: List):
     script_name = script.title().lower()
