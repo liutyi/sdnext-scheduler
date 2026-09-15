@@ -338,10 +338,6 @@ def map_ui_task_args_list_to_named_args(args: List, is_img2img: bool):
         args.insert(arg_names.index("request"), None)
 
     named_args = dict(zip(arg_names, args[0 : len(arg_names)]))
-    log.debug(f"AS args: total={len(args)} names={len(arg_names)} "
-          f"prompt={named_args.get('prompt')!r} steps={named_args.get('steps')!r} "
-          f"sampler_index={named_args.get('sampler_index')!r}")
-    log.debug("AS args: " + ", ".join(f"{k}:{type(v).__name__}" for k, v in named_args.items()))
     script_args = args[len(arg_names) :]
 
     override_settings_texts: List[str] = named_args.get("override_settings_texts", [])
